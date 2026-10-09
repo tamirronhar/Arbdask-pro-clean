@@ -133,7 +133,38 @@ button{border:0;border-radius:10px;background:var(--blue);color:white;font-weigh
 <div class="card"><div class="label">Mercados demonstrativos</div><div class="value" id="market-count">—</div><div class="small">USDT · USDC · BRL</div></div>
 <div class="card"><div class="label">Oportunidades elegíveis</div><div class="value" id="qualified">—</div><div class="small">Após custos estimados</div></div>
 <div class="card"><div class="label">Simulações realizadas</div><div class="value" id="runs">0</div><div class="small">Histórico desta sessão</div></div></section>
-<div class="layout"><section class="card"><h2>Oportunidades de demonstração</h2><div class="table-wrap"><table><thead><tr><th>Par</th><th>Comprar em</th><th>Vender em</th><th>Margem líquida</th><th>Estado</th></tr></thead><tbody id="opps"><tr><td colspan="5">A carregar…</td></tr></tbody></table></div><div class="notice">Taxas e slippage também são fictícios. Margem estimada não é lucro garantido.</div></section>
+
+</section>
+
+<section class="card" style="margin-bottom:18px">
+<h2>Cotações públicas das corretoras</h2>
+<div class="notice">
+Preços indicativos consultados nas APIs públicas. Alguns pares podem não estar disponíveis. Sem execução de operações.
+</div>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Par</th>
+<th>Corretora</th>
+<th>Bid — venda</th>
+<th>Ask — compra</th>
+<th>Estado</th>
+</tr>
+</thead>
+<tbody id="live-quotes">
+<tr><td colspan="5">A consultar corretoras…</td></tr>
+</tbody>
+</table>
+</div>
+<div id="live-status" class="notice">A iniciar consulta…</div>
+<button class="secondary" id="refresh-live" type="button">
+Atualizar cotações
+</button>
+</section>
+
+<div class="layout"><section class="card"><h2>Oportunidades de demonstração</h2>
+
 <aside class="card"><h2>Executar simulação</h2><form id="sim-form"><label>Capital de teste<input id="capital" type="number" min="1" max="1000000" step="1" value="100" required></label><label>Margem líquida mínima (%)<input id="margin" type="number" min="0" max="100" step="0.05" value="0.20" required></label><button type="submit">Simular melhor oportunidade</button></form><div id="sim-result" class="notice">A simulação não movimenta fundos.</div><button class="secondary" id="refresh" type="button">Atualizar painel</button></aside></div>
 <section class="card history"><h2>Histórico de simulações</h2><div id="history" class="empty">Ainda não existem simulações.</div></section></main>
 <footer>ArbDask PRO · Base limpa · Simulação apenas · Sem execução real</footer>
