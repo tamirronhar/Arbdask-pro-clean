@@ -1,0 +1,27 @@
+
+name: ArbDask PRO clean tests
+
+on:
+  push:
+    branches: [main, principal]
+  pull_request:
+    branches: [main, principal]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obter código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verificar sintaxe
+        run: python -m compileall -q app.py tests
+
+      - name: Executar testes
+        run: python -m unittest discover -s tests -v
