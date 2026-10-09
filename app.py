@@ -1,4 +1,4 @@
-"""ArbDask PRO Clean: MVP seguro, apenas demonstração e simulação."""
+"""ArbDask application package."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from datetime import datetime, timezone
