@@ -2,12 +2,73 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from datetime import datetime, timezone
-import json, threading, uuid
+import json, threading, uuid, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from market_data import FETCHERS, SUPPORTED_PAIRS, fetch_quote
 
 APP_NAME = "ArbDask PRO"
 MODE = "SIMULATION_ONLY"
 LOCK = threading.Lock()
 HISTORY = []
+MARKET_CACHE_LOCK = threading.Lock()
+MARKET_CACHE = {"fetched_at": 0.0, "quotes": []}
+MARKET_CACHE_TTL_SECONDS = 10
+
+
+def market_snapshot(force=False):
+    """Consulta cotações públicas sem executar operações."""
+    now = time.time()
+
+    with MARKET_CACHE_LOCK:
+        if (
+            not force
+            and now - MARKET_CACHE["fetched_at"]
+            < MARKET_CACHE_TTL_SECONDS
+        ):
+            return list(MARKET_CACHE["quotes"])
+
+    jobs = [
+        (exchange, pair)
+        for pair in SUPPORTED_PAIRS
+        for exchange in FETCHERS
+    ]
+
+    quotes = []
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = {
+            pool.submit(fetch_quote, exchange, pair): (exchange, pair)
+            for exchange, pair in jobs
+        }
+
+        for future in as_completed(futures):
+            exchange, pair = futures[future]
+
+            try:
+                quotes.append(future.result().to_dict())
+            except Exception as exc:
+                quotes.append({
+                    "exchange": exchange,
+                    "pair": pair,
+                    "bid": None,
+                    "ask": None,
+                    "timestamp": None,
+                    "timestamp_ms": None,
+                    "age_ms": None,
+                    "source": None,
+                    "status": "UNAVAILABLE",
+                    "error": str(exc)[:180],
+                })
+
+    quotes.sort(
+        key=lambda row: (row["pair"], row["exchange"])
+    )
+
+    with MARKET_CACHE_LOCK:
+        MARKET_CACHE["fetched_at"] = time.time()
+        MARKET_CACHE["quotes"] = list(quotes)
+
+    return quotes
 # Dados fictícios, nunca apresentados como preços reais.
 DEMO_MARKETS = [
     {"asset":"USDT/USDC","buy_exchange":"Binance (demo)","sell_exchange":"OKX (demo)","buy_price":0.9992,"sell_price":1.0001,"fees_pct":0.12,"slippage_pct":0.03},
@@ -91,6 +152,25 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/": self.send_data(200,DASHBOARD,"text/html; charset=utf-8")
         elif path=="/api/status": self.send_data(200,{"app":APP_NAME,"mode":MODE,"execution_enabled":False})
         elif path=="/api/opportunities": self.send_data(200,opportunities())
+        elif path == "/api/market-data":
+            force = urlparse(self.path).query == "refresh=1"
+            quotes = market_snapshot(force=force)
+
+            with MARKET_CACHE_LOCK:
+                fetched_at = (
+                    datetime.fromtimestamp(
+                        MARKET_CACHE["fetched_at"],
+                        timezone.utc
+                    ).isoformat(timespec="seconds")
+                    if MARKET_CACHE["fetched_at"]
+                    else None
+                )
+
+            self.send_data(200, {
+                "quotes": quotes,
+                "fetched_at": fetched_at,
+                "execution_enabled": False
+            })
         elif path=="/api/history":
             with LOCK: self.send_data(200,list(HISTORY))
         else: self.send_data(404,{"error":"Endpoint não encontrado."})
