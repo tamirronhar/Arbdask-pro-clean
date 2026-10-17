@@ -63,13 +63,19 @@ function spotOpts(id) {
 }
 function buildClient(id) {
   const store = readJSON(KEYS_FILE, {});
-  const creds = store[id] ? dec(store[id]) : {};
+  const creds = store[id] ? dec(store[id]) : envCreds(id);
   const ex = new ccxt[id]({ enableRateLimit: true, timeout: 15000, options: spotOpts(id), ...creds });
   clients[id] = ex;
   return ex;
 }
 const client = id => clients[id] || buildClient(id);
-const hasKeys = id => !!readJSON(KEYS_FILE, {})[id];
+// chaves também podem vir de variáveis de ambiente (persistem no Render Free): KUCOIN_API_KEY, KUCOIN_SECRET, KUCOIN_PASSWORD
+function envCreds(id) {
+  const P = id.toUpperCase(), k = process.env[P + '_API_KEY'], s = process.env[P + '_SECRET'], pw = process.env[P + '_PASSWORD'];
+  if (!k || !s) return {};
+  const c = { apiKey: k.trim(), secret: s.trim() }; if (pw) c.password = pw.trim(); return c;
+}
+const hasKeys = id => !!readJSON(KEYS_FILE, {})[id] || !!envCreds(id).apiKey;
 
 async function ensureMarkets(ex) { if (!ex.markets) await ex.loadMarkets(); return ex.markets; }
 
