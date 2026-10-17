@@ -71,7 +71,10 @@ function buildClient(id) {
 const client = id => clients[id] || buildClient(id);
 // chaves também podem vir de variáveis de ambiente (persistem no Render Free): KUCOIN_API_KEY, KUCOIN_SECRET, KUCOIN_PASSWORD
 function envCreds(id) {
-  const P = id.toUpperCase(), k = process.env[P + '_API_KEY'], s = process.env[P + '_SECRET'], pw = process.env[P + '_PASSWORD'];
+  const P = id.toUpperCase();
+  let k = process.env[P + '_API_KEY'], s = process.env[P + '_SECRET'], pw = process.env[P + '_PASSWORD'];
+  const all = process.env[P + '_CREDS']; // formato: APIKEY:SECRET[:PASSPHRASE]
+  if (all && !k) { const parts = all.trim().split(':'); k = parts[0]; s = parts[1]; if (parts.length > 2) pw = parts.slice(2).join(':'); }
   if (!k || !s) return {};
   const c = { apiKey: k.trim(), secret: s.trim() }; if (pw) c.password = pw.trim(); return c;
 }
