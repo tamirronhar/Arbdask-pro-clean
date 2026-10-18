@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -20,7 +20,7 @@ const MIN_PROFIT_PCT = Number(process.env.MIN_PROFIT_PCT ?? 0.15);   // lucro l�
 const MAX_ORDER_QUOTE = Number(process.env.MAX_ORDER_QUOTE ?? 200);  // valor máximo por operação (na moeda de cotação)
 const DEFAULT_AMOUNT = Number(process.env.DEFAULT_AMOUNT ?? 50);     // quantidade base sugerida por oportunidade
 const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS ?? 3);
-const SYMBOLS = (process.env.SYMBOLS || 'USDC/USDT,FDUSD/USDT,USDE/USDT,TUSD/USDT,PYUSD/USDT,USD1/USDT').split(',').map(s => s.trim()).filter(Boolean);
+const SYMBOLS = (process.env.SYMBOLS || 'USDC/USDT,FDUSD/USDT,USDE/USDT,TUSD/USDT,PYUSD/USDT,USD1/USDT,EURC/USDT,EURI/USDT,EURC/USDC').split(',').map(s => s.trim()).filter(Boolean);
 const EXCHANGES = (process.env.EXCHANGES || 'binance,bybit,okx,kucoin,bitget,mexc,gate').split(',').map(s => s.trim()).filter(Boolean);
 const COINS = [...new Set(SYMBOLS.flatMap(s => s.split('/')))];
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim());
