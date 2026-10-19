@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -220,7 +220,7 @@ app.post('/api/execute', wrap(async (req, res) => {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     if (STOPPED) break;
     // RECALCULAR ROTA com livros de ofertas atuais
-    const q = await quote(buyExchange, sellExchange, symbol, amount);
+    let q = await quote(buyExchange, sellExchange, symbol, amount);
     last = q;
     if (!q) { await sleep(1500); continue; }
     if (q.amount * q.buyPrice > MAX_ORDER_QUOTE)
@@ -240,6 +240,11 @@ app.post('/api/execute', wrap(async (req, res) => {
     const [bBal, sBal] = await Promise.all([bx.fetchBalance(), sx.fetchBalance()]);
     if ((bBal.free[quoteCur] ?? 0) < amount * q.buyLimit * 1.002 || (sBal.free[base] ?? 0) < amount)
       return res.json({ ok: true, status: 'aborted', attempts: attempt, netProfit: 0, message: `Saldo insuficiente: precisa de ${quoteCur} na ${buyExchange} e ${base} na ${sellExchange}`, orders: [] });
+
+    // REVERIFICAÇÃO FINAL: livros lidos de novo imediatamente antes de enviar as ordens
+    const f = await quote(buyExchange, sellExchange, symbol, amount);
+    if (!f || f.netPct < MIN_PROFIT_PCT) { last = f || last; await sleep(1500 * attempt); continue; }
+    Object.assign(q, f);
 
     // ordens LIMIT IOC no pior preço calculado: nunca executam a preço pior que o recalculado
     const amt = Number(bx.amountToPrecision(symbol, amount));
