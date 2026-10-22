@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.2.1';
+const VERSION = '1.2.2';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -143,6 +143,20 @@ app.get('/api/health', wrap(async (req, res) => {
   res.json({ ok: true, version: VERSION, dryRun: DRY_RUN, stopped: STOPPED, symbols: SYMBOLS,
     minProfitPct: MIN_PROFIT_PCT, maxOrderQuote: MAX_ORDER_QUOTE,
     exchanges: EXCHANGES.map(id => ({ id, keys: hasKeys(id) })) });
+}));
+
+// desconto GT na Gate (taxa spot 0,10% -> 0,09% em VIP0). Só muda a forma de pagar a taxa; não mexe na estratégia.
+app.get('/api/gate/gt-fee', wrap(async (req, res) => {
+  if (!hasKeys('gate')) return res.status(400).json({ ok: false, error: 'Gate sem chave' });
+  const r = await client('gate').privateAccountGetDebitFee();
+  res.json({ ok: true, gate: r });
+}));
+app.post('/api/gate/gt-fee', wrap(async (req, res) => {
+  if (!hasKeys('gate')) return res.status(400).json({ ok: false, error: 'Gate sem chave' });
+  const enabled = req.body?.enabled !== false;
+  await client('gate').privateAccountPostDebitFee({ enabled });
+  const r = await client('gate').privateAccountGetDebitFee();
+  res.json({ ok: true, gate: r });
 }));
 
 app.post('/api/keys', wrap(async (req, res) => {
