@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.2.3';
+const VERSION = '1.2.4';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -276,9 +276,14 @@ app.post('/api/execute', wrap(async (req, res) => {
     const orders = [o1, o2].map((r, i) => r.status === 'fulfilled'
       ? { side: i ? 'sell' : 'buy', id: r.value.id, filled: r.value.filled, price: r.value.average ?? r.value.price, status: r.value.status }
       : { side: i ? 'sell' : 'buy', error: r.reason?.message });
-    const fb = orders[0].filled || 0, fsl = orders[1].filled || 0;
-    const ok = orders.every(o => !o.error) && fb > 0 && Math.abs(fb - fsl) <= amt * 0.01;
-    if (!ok && (fb > 0 || fsl > 0)) STOPPED = true; // perna desequilibrada: pára tudo até o utilizador verificar
+    let fb = orders[0].filled || 0, fsl = orders[1].filled || 0;
+    // PERNA INCOMPLETA: tenta completar o lado que ficou atrás (até 3x, sempre com lucro líquido >= 0 na rota completa)
+    if ((fb > 0 || fsl > 0) && Math.abs(fb - fsl) > amt * 0.01) {
+      const fix = await completeLeg({ bx, sx, symbol, fb, fsl, q });
+      orders.push(...fix.orders); fb = fix.fb; fsl = fix.fsl;
+    }
+    const ok = fb > 0 && Math.abs(fb - fsl) <= amt * 0.01;
+    if (!ok && (fb > 0 || fsl > 0)) STOPPED = true; // continua desequilibrada: pára tudo até o utilizador verificar
     const t = { status: ok ? 'executed' : (fb > 0 || fsl > 0) ? 'partial' : 'aborted', symbol, buyExchange, sellExchange, amount: amt, netProfit: ok ? q.netProfit : 0, netPct: q.netPct, attempts: attempt, orders };
     record(t);
     return res.json({ ok: true, ...t, message: ok
@@ -290,6 +295,48 @@ app.post('/api/execute', wrap(async (req, res) => {
   const t = { status: 'held', symbol, buyExchange, sellExchange, amount, netProfit: 0, attempts: MAX_ATTEMPTS, lastNetPct: last?.netPct ?? null };
   record(t);
   res.json({ ok: true, ...t, message: `Sem lucro após ${MAX_ATTEMPTS} recálculos — nenhuma ordem enviada, saldo mantido`, orders: [] });
+}));
+
+// completa a perna que ficou para trás sem vender abaixo do custo da compra (nem comprar acima da venda)
+async function completeLeg({ bx, sx, symbol, fb, fsl, q }) {
+  const orders = [];
+  for (let i = 0; i < 3 && Math.abs(fb - fsl) > 1e-9; i++) {
+    const diff = Math.abs(fb - fsl);
+    try {
+      if (fb > fsl) {               // comprou mais do que vendeu: vender o resto na corretora de venda
+        const ob = await sx.fetchOrderBook(symbol, 20); const w = walk(ob.bids, diff);
+        const floor = q.buyPrice * (1 + q.fees.buy) / (1 - q.fees.sell); // preço mínimo sem prejuízo
+        if (!w || w.worst < floor) { await sleep(1500); continue; }
+        const o = await sx.createOrder(symbol, 'limit', 'sell', Number(sx.amountToPrecision(symbol, diff)), Number(sx.priceToPrecision(symbol, w.worst)), { timeInForce: 'IOC' });
+        fsl += o.filled || 0; orders.push({ side: 'sell', fix: true, id: o.id, filled: o.filled, price: o.average ?? o.price });
+      } else {                      // vendeu mais do que comprou: comprar o resto na corretora de compra
+        const ob = await bx.fetchOrderBook(symbol, 20); const w = walk(ob.asks, diff);
+        const cap = q.sellPrice * (1 - q.fees.sell) / (1 + q.fees.buy); // preço máximo sem prejuízo
+        if (!w || w.worst > cap) { await sleep(1500); continue; }
+        const o = await bx.createOrder(symbol, 'limit', 'buy', Number(bx.amountToPrecision(symbol, diff)), Number(bx.priceToPrecision(symbol, w.worst)), { timeInForce: 'IOC' });
+        fb += o.filled || 0; orders.push({ side: 'buy', fix: true, id: o.id, filled: o.filled, price: o.average ?? o.price });
+      }
+    } catch (e) { orders.push({ fix: true, error: e.message }); await sleep(1500); }
+  }
+  return { orders, fb, fsl };
+}
+
+// INVENTÁRIO: mostra quantas operações ainda cabem em cada lado e avisa quando é preciso reequilibrar
+const REBALANCE_MIN_OPS = Number(process.env.REBALANCE_MIN_OPS ?? 2);
+app.get('/api/inventory', wrap(async (req, res) => {
+  const amount = Number(req.query.amount) || DEFAULT_AMOUNT;
+  const ids = EXCHANGES.filter(hasKeys);
+  const bals = {};
+  await Promise.all(ids.map(async id => { try { bals[id] = (await client(id).fetchBalance()).free; } catch (e) { bals[id] = { error: e.message }; } }));
+  const out = ids.map(id => {
+    const b = bals[id] || {}; if (b.error) return { exchange: id, error: b.error };
+    const coins = Object.fromEntries(COINS.map(c => [c, b[c] ?? 0]));
+    const opsBuy = Math.floor((coins.USDT || 0) / amount);           // compras possíveis aqui (gasta USDT)
+    const low = COINS.filter(c => c !== 'USDT' && (coins[c] || 0) > 0 && coins[c] < amount * REBALANCE_MIN_OPS);
+    return { exchange: id, coins, opsBuy, needsRebalance: opsBuy < REBALANCE_MIN_OPS || low.length > 0, lowCoins: low };
+  });
+  res.json({ ok: true, amount, minOps: REBALANCE_MIN_OPS, inventory: out,
+    note: 'Reequilibrar só quando necessário, pela rede mais barata (ex.: BEP20 / TRC20 conforme a moeda), e de preferência em lote.' });
 }));
 
 app.post('/api/stop', wrap(async (req, res) => { STOPPED = true; res.json({ ok: true, stopped: true }); }));
