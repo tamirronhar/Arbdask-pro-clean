@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.2.4';
+const VERSION = '1.2.5';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -113,22 +113,42 @@ function walk(levels, amount) {
   return { avg: cost / amount, worst };
 }
 
+function calcRoute(bb, sb, fb, fs_, amount) {
+  const buy = walk(bb.asks, amount), sell = walk(sb.bids, amount);
+  if (!buy || !sell) return null;
+  const spend = amount * buy.avg, feeBuy = spend * fb;
+  const gross = amount * sell.avg, feeSell = gross * fs_;
+  const cost = spend + feeBuy, revenue = gross - feeSell, net = revenue - cost;
+  return { buy, sell, spend, feeBuy, gross, feeSell, cost, revenue, net, netPct: (net / cost) * 100 };
+}
+
 async function quote(buyId, sellId, symbol, amount) {
   const bx = client(buyId), sx = client(sellId);
   await Promise.all([ensureMarkets(bx), ensureMarkets(sx)]);
   const [bb, sb] = await Promise.all([bx.fetchOrderBook(symbol, 20), sx.fetchOrderBook(symbol, 20)]);
-  const buy = walk(bb.asks, amount), sell = walk(sb.bids, amount);
-  if (!buy || !sell) return null;
   const fb = takerFee(bx, symbol), fs_ = takerFee(sx, symbol);
-  const cost = amount * buy.avg * (1 + fb);
-  const revenue = amount * sell.avg * (1 - fs_);
-  const net = revenue - cost;
+  const r = calcRoute(bb, sb, fb, fs_, amount);
+  if (!r) return null;
+  // maior quantidade (até MAX_ORDER_QUOTE) que ainda dá lucro líquido >= mínimo, com os livros atuais
+  let lo = 0, hi = MAX_ORDER_QUOTE / Math.max(bb.asks[0]?.[0] || 1, 1e-9), best = null;
+  for (let i = 0; i < 30; i++) {
+    const mid = (lo + hi) / 2, m = calcRoute(bb, sb, fb, fs_, mid);
+    if (m && m.netPct >= MIN_PROFIT_PCT) { lo = mid; best = m; } else hi = mid;
+  }
+  const q = symbol.split('/')[1];
   return {
     symbol, buyExchange: buyId, sellExchange: sellId, amount,
-    buyPrice: buy.avg, sellPrice: sell.avg, buyLimit: buy.worst, sellLimit: sell.worst,
-    grossPct: (sell.avg / buy.avg - 1) * 100,
-    netPct: (net / cost) * 100, netProfit: net, quote: symbol.split('/')[1],
-    fees: { buy: fb, sell: fs_ }
+    buyPrice: r.buy.avg, sellPrice: r.sell.avg, buyLimit: r.buy.worst, sellLimit: r.sell.worst,
+    grossPct: (r.sell.avg / r.buy.avg - 1) * 100,
+    netPct: r.netPct, netProfit: r.net, quote: q,
+    fees: { buy: fb, sell: fs_ },
+    // previsão em valores, antes de qualquer ordem
+    preview: {
+      invest: r.cost, revenue: r.revenue, grossProfit: r.gross - r.spend,
+      feesTotal: r.feeBuy + r.feeSell, netProfit: r.net, netPct: r.netPct,
+      meetsMin: r.netPct >= MIN_PROFIT_PCT, minProfitPct: MIN_PROFIT_PCT,
+      maxAmount: best ? lo : 0, maxInvest: best ? best.cost : 0, maxNetProfit: best ? best.net : 0
+    }
   };
 }
 
@@ -225,6 +245,20 @@ async function scanOpps(amount, all) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function record(t) { const h = readJSON(HIST_FILE, []); h.unshift({ at: new Date().toISOString(), ...t }); writeJSON(HIST_FILE, h.slice(0, 1000)); }
 
+// PREVISÃO: quanto se ganha nesta rota antes de executar (não envia ordens)
+app.get('/api/preview', wrap(async (req, res) => {
+  const { buy, sell, symbol } = req.query; const amount = Number(req.query.amount) || DEFAULT_AMOUNT;
+  if (!EXCHANGES.includes(buy) || !EXCHANGES.includes(sell) || buy === sell) return res.status(400).json({ ok: false, error: 'Corretoras inválidas' });
+  if (!SYMBOLS.includes(symbol)) return res.status(400).json({ ok: false, error: 'Par não permitido' });
+  const q = await quote(buy, sell, symbol, amount);
+  if (!q) return res.json({ ok: true, available: false, message: 'Livro sem profundidade suficiente para esta quantidade' });
+  const p = q.preview, c = q.quote;
+  res.json({ ok: true, available: true, ...q, dryRun: DRY_RUN,
+    message: `Previsão: investe ${p.invest.toFixed(4)} ${c}, recebe ${p.revenue.toFixed(4)} ${c}, taxas ${p.feesTotal.toFixed(4)} ${c} → lucro líquido ${p.netProfit.toFixed(4)} ${c} (${p.netPct.toFixed(3)}%). ` +
+      (p.meetsMin ? 'Passa o mínimo.' : `Abaixo do mínimo de ${MIN_PROFIT_PCT}% — não executaria.`) +
+      (p.maxAmount > 0 ? ` Cabe até ${p.maxInvest.toFixed(2)} ${c} com lucro ≈ ${p.maxNetProfit.toFixed(4)} ${c}.` : '') });
+}));
+
 app.post('/api/execute', wrap(async (req, res) => {
   if (STOPPED) return res.status(423).json({ ok: false, status: 'aborted', message: 'Bot parado pelo botão de emergência' });
   const { buyExchange, sellExchange, symbol } = req.body || {};
@@ -251,7 +285,7 @@ app.post('/api/execute', wrap(async (req, res) => {
     if (q.netPct < MIN_PROFIT_PCT) { await sleep(1500 * attempt); continue; }
 
     if (DRY_RUN) {
-      const t = { status: 'dry_run', symbol, buyExchange, sellExchange, amount, netProfit: q.netProfit, netPct: q.netPct, attempts: attempt };
+      const t = { status: 'dry_run', symbol, buyExchange, sellExchange, amount, netProfit: q.netProfit, netPct: q.netPct, attempts: attempt, preview: q.preview };
       record(t);
       return res.json({ ok: true, ...t, message: `Simulação: lucro líquido ${q.netProfit.toFixed(4)} ${quoteCur} (${q.netPct.toFixed(3)}%) — nenhuma ordem enviada (DRY_RUN)`, orders: [] });
     }
@@ -284,7 +318,7 @@ app.post('/api/execute', wrap(async (req, res) => {
     }
     const ok = fb > 0 && Math.abs(fb - fsl) <= amt * 0.01;
     if (!ok && (fb > 0 || fsl > 0)) STOPPED = true; // continua desequilibrada: pára tudo até o utilizador verificar
-    const t = { status: ok ? 'executed' : (fb > 0 || fsl > 0) ? 'partial' : 'aborted', symbol, buyExchange, sellExchange, amount: amt, netProfit: ok ? q.netProfit : 0, netPct: q.netPct, attempts: attempt, orders };
+    const t = { status: ok ? 'executed' : (fb > 0 || fsl > 0) ? 'partial' : 'aborted', symbol, buyExchange, sellExchange, amount: amt, netProfit: ok ? q.netProfit : 0, netPct: q.netPct, attempts: attempt, preview: q.preview, orders };
     record(t);
     return res.json({ ok: true, ...t, message: ok
       ? `Executado: lucro estimado ${q.netProfit.toFixed(4)} ${quoteCur}`
