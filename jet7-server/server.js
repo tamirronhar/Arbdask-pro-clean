@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.2.2';
+const VERSION = '1.2.3';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -89,9 +89,16 @@ async function supports(id, symbol) {
   catch (e) { marketFail[id] = Date.now(); console.warn(`[${id}] mercados indisponíveis: ${e.message.slice(0, 120)}`); return false; }
 }
 
+// desconto de taxa por pagar com o token da corretora (BNB, KCS, MX, GT). Só afeta o cálculo/simulação.
+// FEE_DISCOUNT=false desliga; FEE_DISCOUNTS=binance:0.75,kucoin:0.8,... substitui os multiplicadores.
+const FEE_DISCOUNT = String(process.env.FEE_DISCOUNT ?? 'true').toLowerCase() !== 'false';
+const FEE_MULT = Object.assign({ binance: 0.75, kucoin: 0.8, mexc: 0.8, gate: 0.9 },
+  Object.fromEntries((process.env.FEE_DISCOUNTS || '').split(',').map(x => x.split(':').map(y => y.trim()))
+    .filter(([k, v]) => k && !isNaN(Number(v))).map(([k, v]) => [k, Number(v)])));
 function takerFee(ex, symbol) {
   const m = ex.markets && ex.markets[symbol];
-  return m && typeof m.taker === 'number' ? m.taker : 0.001;
+  const base = m && typeof m.taker === 'number' ? m.taker : 0.001;
+  return FEE_DISCOUNT && FEE_MULT[ex.id] ? base * FEE_MULT[ex.id] : base;
 }
 
 // preço médio para encher `amount` no livro (inclui slippage real) e o pior preço tocado
@@ -140,7 +147,7 @@ app.use('/api', (req, res, next) => {
 const wrap = fn => (req, res) => fn(req, res).catch(e => res.status(500).json({ ok: false, error: e.message }));
 
 app.get('/api/health', wrap(async (req, res) => {
-  res.json({ ok: true, version: VERSION, dryRun: DRY_RUN, stopped: STOPPED, symbols: SYMBOLS,
+  res.json({ ok: true, version: VERSION, dryRun: DRY_RUN, feeDiscount: FEE_DISCOUNT ? FEE_MULT : false, stopped: STOPPED, symbols: SYMBOLS,
     minProfitPct: MIN_PROFIT_PCT, maxOrderQuote: MAX_ORDER_QUOTE,
     exchanges: EXCHANGES.map(id => ({ id, keys: hasKeys(id) })) });
 }));
