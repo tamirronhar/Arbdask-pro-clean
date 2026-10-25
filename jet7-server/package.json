@@ -4,7 +4,7 @@
   "description": "",
   "main": "server.js",
   "scripts": {
-    "start": "node --max-old-space-size=400 --expose-gc server.js",
+    "start": "node --max-old-space-size=280 --max-semi-space-size=8 --expose-gc server.js",
     "gerar-chaves": "node gerar-chaves.js"
   },
   "keywords": [],
