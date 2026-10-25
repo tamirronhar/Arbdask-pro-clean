@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -20,7 +20,7 @@ const MIN_PROFIT_PCT = Number(process.env.MIN_PROFIT_PCT ?? 0.15);   // lucro l�
 const MAX_ORDER_QUOTE = Number(process.env.MAX_ORDER_QUOTE ?? 200);  // valor máximo por operação (na moeda de cotação)
 const DEFAULT_AMOUNT = Number(process.env.DEFAULT_AMOUNT ?? 50);     // quantidade base sugerida por oportunidade
 const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS ?? 3);
-const SYMBOLS = (process.env.SYMBOLS || 'USDC/USDT,FDUSD/USDT,USDE/USDT,TUSD/USDT,PYUSD/USDT,USD1/USDT,EURC/USDT,EURI/USDT,EURC/USDC').split(',').map(s => s.trim()).filter(Boolean);
+const SYMBOLS = (process.env.SYMBOLS || 'USDC/USDT,FDUSD/USDT,USDE/USDT,TUSD/USDT,PYUSD/USDT,USD1/USDT,DAI/USDT,USDD/USDT,RLUSD/USDT,USDP/USDT,USDS/USDT,EURC/USDT,EURI/USDT,EURC/USDC,FDUSD/USDC,USDE/USDC,USD1/USDC,PYUSD/USDC').split(',').map(s => s.trim()).filter(Boolean);
 const EXCHANGES = (process.env.EXCHANGES || 'binance,bybit,okx,kucoin,bitget,mexc,gate').split(',').map(s => s.trim()).filter(Boolean);
 const COINS = [...new Set(SYMBOLS.flatMap(s => s.split('/')))];
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim());
@@ -169,10 +169,12 @@ async function quote(buyId, sellId, symbol, amount) {
   const r = calcRoute(bb, sb, fb, fs_, amount);
   if (!r) return null;
   // maior quantidade (até MAX_ORDER_QUOTE) que ainda dá lucro líquido >= mínimo, com os livros atuais
-  let lo = 0, hi = MAX_ORDER_QUOTE / Math.max(bb.asks[0]?.[0] || 1, 1e-9), best = null;
-  for (let i = 0; i < 30; i++) {
-    const mid = (lo + hi) / 2, m = calcRoute(bb, sb, fb, fs_, mid);
-    if (m && m.netPct >= MIN_PROFIT_PCT) { lo = mid; best = m; } else hi = mid;
+  // tamanho (até MAX_ORDER_QUOTE) que dá o MAIOR lucro em USDT com lucro líquido >= mínimo
+  const hiAmt = MAX_ORDER_QUOTE / Math.max(bb.asks[0]?.[0] || 1, 1e-9);
+  let lo = 0, best = null;
+  for (let i = 1; i <= 40; i++) {
+    const amt = hiAmt * i / 40, m = calcRoute(bb, sb, fb, fs_, amt);
+    if (m && m.netPct >= MIN_PROFIT_PCT && (!best || m.net > best.net)) { best = m; lo = amt; }
   }
   const q = symbol.split('/')[1];
   return {
@@ -313,7 +315,8 @@ async function scanOpps(amount, all) {
     const qs = await Promise.all(pairs.map(([a, b]) => quote(a, b, symbol, amount).catch(() => null)));
     for (const q of qs) if (q && (all || q.netPct > 0)) list.push({ id: `${symbol}:${q.buyExchange}>${q.sellExchange}`, ...q });
   }
-  list.sort((x, y) => y.netPct - x.netPct);
+  // ordena pelo lucro em USDT: primeiro o maior lucro possível, depois o lucro na quantidade base
+  list.sort((x, y) => (y.preview.maxNetProfit - x.preview.maxNetProfit) || (y.netProfit - x.netProfit));
   return { ok: true, minProfitPct: MIN_PROFIT_PCT, opportunities: list.slice(0, 20) };
 }
 
