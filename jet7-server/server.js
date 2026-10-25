@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.9.1';
+const VERSION = '1.9.2';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -81,7 +81,23 @@ function envCreds(id) {
 }
 const hasKeys = id => !!readJSON(KEYS_FILE, {})[id] || !!envCreds(id).apiKey;
 
-async function ensureMarkets(ex) { if (!ex.markets) await ex.loadMarkets(); return ex.markets; }
+// carrega mercados UMA corretora de cada vez e guarda só os pares do JET7 (poupa centenas de MB no Render Free)
+let marketLock = Promise.resolve();
+const KEEP_COINS = () => new Set(SYMBOLS.flatMap(x => x.split('/')).concat(['BNB', 'KCS', 'MX', 'GT', 'BGB']));
+async function ensureMarkets(ex) {
+  if (ex.markets) return ex.markets;
+  const run = marketLock.then(async () => {
+    if (ex.markets) return;
+    const all = await ex.loadMarkets();
+    const keep = KEEP_COINS(), mk = {}, cur = {};
+    for (const [sym, m] of Object.entries(all)) if (SYMBOLS.includes(sym) || (m.spot && keep.has(m.base) && m.quote === 'USDT')) mk[sym] = m;
+    for (const [c, v] of Object.entries(ex.currencies || {})) if (keep.has(c)) cur[c] = v;
+    ex.setMarkets(Object.values(mk), cur);
+    if (global.gc) global.gc();
+  });
+  marketLock = run.catch(() => {});
+  await run; return ex.markets;
+}
 
 const marketFail = {}; // corretora indisponível (ex.: bloqueio regional) -> tenta de novo após 60s
 async function supports(id, symbol) {
@@ -711,7 +727,7 @@ async function networksOf(id) {
   if (c && Date.now() - c.at < (c.error ? 300000 : NET_TTL)) return c.cur;
   const ex = client(id); let cur = {};
   try {
-    cur = await ex.fetchCurrencies() || {};
+    { const all = await ex.fetchCurrencies() || {}, keep = KEEP_COINS(); cur = {}; for (const c of Object.keys(all)) if (keep.has(c)) cur[c] = all[c]; }
     const codes = [...new Set(SYMBOLS.map(x => x.split('/')[0]))];
     const missing = codes.some(code => Object.values(cur[code]?.networks || {}).some(n => typeof n.fee !== 'number'));
     if (missing && ex.has.fetchDepositWithdrawFees && hasKeys(id)) {
