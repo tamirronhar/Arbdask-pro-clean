@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.7.1';
+const VERSION = '1.7.2';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -51,7 +51,8 @@ const writeJSON = (f, v) => fs.writeFileSync(f, JSON.stringify(v, null, 2), { mo
 
 // ---------- corretoras ----------
 const clients = {};       // id -> instância ccxt (pública ou autenticada)
-let STOPPED = false;      // botão de emergência
+let STOPPED = false;      // botão de emergência (guardado no Gist: sobrevive a reinícios)
+function setStopped(v) { STOPPED = !!v; try { autobot.stopped = STOPPED; saveAutobot(); } catch (e) {} }
 
 function spotOpts(id) {
   // só mercado spot (evita carregar futuros e endpoints bloqueados por região)
@@ -543,7 +544,7 @@ async function executeRoute(input) {
       orders.push(...fix.orders); fb = fix.fb; fsl = fix.fsl;
     }
     const ok = fb > 0 && Math.abs(fb - fsl) <= amt * 0.01;
-    if (!ok && (fb > 0 || fsl > 0)) STOPPED = true; // continua desequilibrada: pára tudo até o utilizador verificar
+    if (!ok && (fb > 0 || fsl > 0)) setStopped(true); // continua desequilibrada: pára tudo até o utilizador verificar
     const t = { status: ok ? 'executed' : (fb > 0 || fsl > 0) ? 'partial' : 'aborted', symbol, buyExchange, sellExchange, amount: amt, netProfit: ok ? q.netProfit : 0, netPct: q.netPct, attempts: attempt, preview: q.preview, orders };
     record({ source, ...t });
     return send(200, { ok: true, ...t, message: ok
@@ -591,9 +592,9 @@ app.get('/api/inventory', wrap(async (req, res) => {
   const out = ids.map(id => {
     const b = bals[id] || {}; if (b.error) return { exchange: id, error: b.error };
     const coins = Object.fromEntries(COINS.map(c => [c, b[c] ?? 0]));
-    const opsBuy = Math.floor((coins.USDT || 0) / amount);           // compras possíveis aqui (gasta USDT)
-    const low = COINS.filter(c => c !== 'USDT' && (coins[c] || 0) > 0 && coins[c] < amount * REBALANCE_MIN_OPS);
-    return { exchange: id, coins, opsBuy, needsRebalance: opsBuy < REBALANCE_MIN_OPS || low.length > 0, lowCoins: low };
+    const opsBuy = Math.floor((coins.USDT || 0) / amount), opsBuyUSDC = Math.floor((coins.USDC || 0) / amount); // compras possíveis (pares /USDT e /USDC)
+    const low = COINS.filter(c => c !== 'USDT' && c !== 'USDC' && (coins[c] || 0) > 0 && coins[c] < amount * REBALANCE_MIN_OPS);
+    return { exchange: id, coins, opsBuy, opsBuyUSDC, needsRebalance: opsBuy < REBALANCE_MIN_OPS || low.length > 0, lowCoins: low };
   });
   res.json({ ok: true, amount, minOps: REBALANCE_MIN_OPS, inventory: out,
     note: 'Reequilibrar só quando necessário, pela rede mais barata (ex.: BEP20 / TRC20 conforme a moeda), e de preferência em lote.' });
@@ -714,6 +715,7 @@ async function executeTransfer(input) {
   const q = await quoteTransfer(buyExchange, sellExchange, symbol, amount);
   if (!q) return { code: 200, body: { ok: true, status: 'aborted', message: 'Sem rede em comum ou livro sem profundidade' } };
   if (q.amount * q.buyPrice > MAX_ORDER_QUOTE) return { code: 400, body: { ok: false, status: 'aborted', message: `Acima do limite por operação (${MAX_ORDER_QUOTE} ${q.quote})` } };
+  if (q.withdrawMin && amount * (1 - q.fees.buy) < q.withdrawMin) return { code: 200, body: { ok: true, status: 'aborted', message: `Abaixo do saque mínimo da rede ${q.network} (${q.withdrawMin})` } };
   if (q.netPct < MIN_PROFIT_PCT) { const t = { type: 'transfer', status: 'held', symbol, buyExchange, sellExchange, amount, netProfit: 0, lastNetPct: q.netPct, network: q.network }; record({ source, ...t }); return { code: 200, body: { ok: true, ...t, message: `Lucro ${q.netPct.toFixed(3)}% abaixo do mínimo depois da taxa de saque — nada executado` } }; }
   if (DRY_RUN) {
     const t = { type: 'transfer', status: 'dry_run', symbol, buyExchange, sellExchange, amount, network: q.network, withdrawFee: q.withdrawFee, netProfit: q.netProfit, netPct: q.netPct, steps: q.steps, preview: q.preview };
@@ -723,7 +725,7 @@ async function executeTransfer(input) {
   if (!hasKeys(buyExchange) || !hasKeys(sellExchange)) return { code: 400, body: { ok: false, error: 'Faltam chaves API nas duas corretoras' } };
   const job = { id: crypto.randomBytes(6).toString('hex'), type: 'transfer', source, symbol, buyExchange, sellExchange, amount, network: q.network, status: 'running', steps: [], startedAt: new Date().toISOString() };
   transferJobs.set(job.id, job);
-  runTransferJob(job, q).catch(e => { job.status = 'error'; job.error = e.message; jobStep(job, 'ERRO', e.message); record({ source, type: 'transfer', status: 'error', symbol, buyExchange, sellExchange, amount, netProfit: 0, message: e.message, steps: job.steps }); STOPPED = true; });
+  runTransferJob(job, q).catch(e => { job.status = 'error'; job.error = e.message; jobStep(job, 'ERRO', e.message); record({ source, type: 'transfer', status: 'error', symbol, buyExchange, sellExchange, amount, netProfit: 0, message: e.message, steps: job.steps }); setStopped(true); });
   return { code: 202, body: { ok: true, status: 'running', jobId: job.id, message: 'Rota com transferência iniciada — acompanhe em /api/transfer-jobs/' + job.id } };
 }
 async function runTransferJob(job, q) {
@@ -754,22 +756,22 @@ async function runTransferJob(job, q) {
   job.withdrawId = w?.id;
   jobStep(job, 'AGUARDAR DEPÓSITO');
   const before = (await sx.fetchBalance()).free[base] ?? 0, expect = sendAmt - net.fee, deadline = Date.now() + TRANSFER_TIMEOUT_MIN * 60000;
-  let arrived = false;
+  let arrived = false, got = 0;
   while (Date.now() < deadline) {
     await sleep(20000);
     const now = (await sx.fetchBalance()).free[base] ?? 0;
-    if (now - before >= expect * 0.98) { arrived = true; break; }
+    if (now - before >= expect * 0.98) { arrived = true; got = Math.min(now - before, expect); break; }
   }
-  if (!arrived) { job.status = 'waiting_deposit'; jobStep(job, 'DEPÓSITO ATRASADO', `Ainda não chegou após ${TRANSFER_TIMEOUT_MIN} min — Autobot parado até verificar`); STOPPED = true; record({ source: job.source, type: 'transfer', status: 'waiting_deposit', symbol, buyExchange, sellExchange, amount: bought, netProfit: 0, withdrawId: job.withdrawId }); return; }
-  const floor = cost / (expect * (1 - takerFee(sx, symbol)));  // preço mínimo de venda sem prejuízo
+  if (!arrived) { job.status = 'waiting_deposit'; jobStep(job, 'DEPÓSITO ATRASADO', `Ainda não chegou após ${TRANSFER_TIMEOUT_MIN} min — Autobot parado até verificar`); setStopped(true); record({ source: job.source, type: 'transfer', status: 'waiting_deposit', symbol, buyExchange, sellExchange, amount: bought, netProfit: 0, withdrawId: job.withdrawId }); return; }
+  const sellQty = got || expect, floor = cost / (sellQty * (1 - takerFee(sx, symbol)));  // preço mínimo de venda sem prejuízo
   for (let i = 1; i <= MAX_ATTEMPTS * 2; i++) {
     jobStep(job, 'RECALCULAR ROTA', 'tentativa ' + i);
-    const ob = await sx.fetchOrderBook(symbol, 20), wk = walk(ob.bids, expect);
+    const ob = await sx.fetchOrderBook(symbol, 20), wk = walk(ob.bids, sellQty);
     if (wk && wk.worst >= floor) {
       jobStep(job, 'VENDER');
-      const so = await sx.createOrder(symbol, 'limit', 'sell', Number(sx.amountToPrecision(symbol, expect)), Number(sx.priceToPrecision(symbol, wk.worst)), { timeInForce: 'IOC' });
+      const so = await sx.createOrder(symbol, 'limit', 'sell', Number(sx.amountToPrecision(symbol, sellQty)), Number(sx.priceToPrecision(symbol, wk.worst)), { timeInForce: 'IOC' });
       const rev = (so.cost ?? (so.filled || 0) * (so.average ?? wk.avg)) * (1 - takerFee(sx, symbol));
-      if ((so.filled || 0) > 0) { const profit = rev - cost * ((so.filled || 0) / expect); job.status = 'executed'; job.netProfit = profit; jobStep(job, 'CONCLUÍDO', `lucro ${profit.toFixed(4)} ${quoteCur}`); record({ source: job.source, type: 'transfer', status: 'executed', symbol, buyExchange, sellExchange, amount: bought, network: net.network, netProfit: profit, steps: job.steps }); return; }
+      if ((so.filled || 0) > 0) { const profit = rev - cost * ((so.filled || 0) / sellQty); job.status = 'executed'; job.netProfit = profit; jobStep(job, 'CONCLUÍDO', `lucro ${profit.toFixed(4)} ${quoteCur}`); record({ source: job.source, type: 'transfer', status: 'executed', symbol, buyExchange, sellExchange, amount: bought, network: net.network, netProfit: profit, steps: job.steps }); return; }
     }
     await sleep(15000 * i);
   }
@@ -814,7 +816,7 @@ async function loadAutobotFromGist() {
   try {
     const g = await gh('/gists/' + await findOrCreateGist());
     const f = g.files[GIST_AUTOBOT];
-    if (f && f.content) { autobot = { ...AUTOBOT_DEFAULT, ...JSON.parse(f.content) }; writeJSON(AUTOBOT_FILE, autobot); console.log('Autobot carregado do Gist: ' + (autobot.enabled ? 'LIGADO' : 'desligado')); }
+    if (f && f.content) { autobot = { ...AUTOBOT_DEFAULT, ...JSON.parse(f.content) }; writeJSON(AUTOBOT_FILE, autobot); if (autobot.stopped) { STOPPED = true; console.log('Botão de emergência continua ATIVO'); } console.log('Autobot carregado do Gist: ' + (autobot.enabled ? 'LIGADO' : 'desligado')); }
   } catch (e) { console.warn('Gist autobot: ' + e.message); }
 }
 
@@ -873,9 +875,12 @@ app.post('/api/autobot', wrap(async (req, res) => {
 }));
 (async () => { await loadAutobotFromGist(); if (autobot.enabled) { autoState.startedAt = new Date().toISOString(); console.log('Autobot a correr no servidor (24h)'); } scheduleAutobot(); })();
 
-app.post('/api/stop', wrap(async (req, res) => { STOPPED = true; res.json({ ok: true, stopped: true }); }));
-app.post('/api/resume', wrap(async (req, res) => { STOPPED = false; res.json({ ok: true, stopped: false }); }));
+app.post('/api/stop', wrap(async (req, res) => { setStopped(true); res.json({ ok: true, stopped: true }); }));
+app.post('/api/resume', wrap(async (req, res) => { setStopped(false); res.json({ ok: true, stopped: false }); }));
 app.get('/api/history', wrap(async (req, res) => res.json({ ok: true, trades: readJSON(HIST_FILE, []).slice(0, 200) })));
 
 app.get('/', (req, res) => res.type('text').send('JET7 server ' + VERSION));
 app.listen(PORT, () => console.log(`JET7 server ${VERSION} na porta ${PORT} — DRY_RUN=${DRY_RUN}`));
+// manter acordado no Render Free (adormece após 15 min sem visitas): ping ao próprio endereço público a cada 10 min
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
+if (SELF_URL) setInterval(() => fetch(SELF_URL + '/').catch(() => {}), 10 * 60000);
