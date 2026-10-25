@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.6.0';
+const VERSION = '1.7.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -107,27 +107,27 @@ async function _refreshFees(id) {
   const c = accountFees[id];
   if (c && Date.now() - c.at < (c.error ? 600000 : FEE_TTL)) return;
   if (!hasKeys(id)) return;
-  const ex = client(id), fees = {};
+  const ex = client(id), fees = {}, makers = {};
   let gtDiscount = false;
   try {
     await ensureMarkets(ex);
     const syms = SYMBOLS.filter(s => ex.markets[s]);
     if (ex.has.fetchTradingFees) {
       const all = await ex.fetchTradingFees();
-      for (const s of syms) if (all[s] && typeof all[s].taker === 'number') fees[s] = all[s].taker;
+      for (const s of syms) { if (all[s] && typeof all[s].taker === 'number') fees[s] = all[s].taker; if (all[s] && typeof all[s].maker === 'number') makers[s] = all[s].maker; }
       if (id === 'gate') gtDiscount = Object.values(all).some(f => f?.info?.gt_discount === true);
     }
     if (ex.has.fetchTradingFee) {
       for (const s of syms.filter(s => fees[s] === undefined)) {
-        try { const f = await ex.fetchTradingFee(s); if (typeof f.taker === 'number') fees[s] = f.taker; } catch (e) {}
+        try { const f = await ex.fetchTradingFee(s); if (typeof f.taker === 'number') fees[s] = f.taker; if (typeof f.maker === 'number') makers[s] = f.maker; } catch (e) {}
       }
     }
     if (id === 'gate' && !gtDiscount) {
       for (const s of syms) { try { const f = await ex.fetchTradingFee(s); if (f?.info?.gt_discount === true) { gtDiscount = true; } break; } catch (e) { break; } }
     }
-    accountFees[id] = { at: Date.now(), fees, gtDiscount };
+    accountFees[id] = { at: Date.now(), fees, makers, gtDiscount };
   } catch (e) {
-    accountFees[id] = { at: Date.now(), fees: accountFees[id]?.fees || {}, error: e.message.slice(0, 160) };
+    accountFees[id] = { at: Date.now(), fees: accountFees[id]?.fees || {}, makers: accountFees[id]?.makers || {}, error: e.message.slice(0, 160) };
   }
 }
 function takerFee(ex, symbol) {
@@ -137,6 +137,34 @@ function takerFee(ex, symbol) {
   // a Gate já devolve a taxa com desconto GT quando está ligado (gt_taker_fee): não aplicar o desconto duas vezes
   const already = typeof real === 'number' && ex.id === 'gate' && accountFees.gate?.gtDiscount;
   return FEE_DISCOUNT && FEE_MULT[ex.id] && !already ? base * FEE_MULT[ex.id] : base;
+}
+
+
+// taxa maker (ordem limitada que fica no livro). Pode ser 0 ou negativa (rebate) — usa-se o valor real com sinal.
+function makerFee(ex, symbol) {
+  const m = ex.markets && ex.markets[symbol];
+  const real = accountFees[ex.id]?.makers?.[symbol];
+  const base = typeof real === 'number' ? real : (m && typeof m.maker === 'number' ? m.maker : takerFee(ex, symbol));
+  const already = typeof real === 'number' && ex.id === 'gate' && accountFees.gate?.gtDiscount;
+  return FEE_DISCOUNT && FEE_MULT[ex.id] && !already && base > 0 ? base * FEE_MULT[ex.id] : base;
+}
+// SIMULAÇÃO maker numa ponta: (A) compra com ordem limitada no melhor bid da corretora de compra e vende a mercado,
+// ou (B) compra a mercado e vende com ordem limitada no melhor ask da corretora de venda. Escolhe a melhor.
+// Atenção: só lucra se alguém executar a ordem limitada; até lá o preço pode mudar.
+const MAKER_MAX_SPREAD = Number(process.env.MAKER_MAX_SPREAD ?? 0.3); // livro com spread maior = mercado parado, ordem dificilmente executa
+function makerVariant(bb, sb, fb, fs_, mb, ms, amount) {
+  const out = [];
+  const sell = walk(sb.bids, amount), bid = bb.bids[0]?.[0];
+  if (sell && bid) { const cost = amount * bid * (1 + mb), rev = amount * sell.avg * (1 - fs_);
+    const sp = ((bb.asks[0]?.[0] || bid) / bid - 1) * 100;
+    out.push({ side: 'compra', bookSpreadPct: sp, makerExchangeFee: mb, limitPrice: bid, cost, revenue: rev, net: rev - cost, netPct: (rev - cost) / cost * 100 }); }
+  const buy = walk(bb.asks, amount), ask = sb.asks[0]?.[0];
+  if (buy && ask) { const cost = amount * buy.avg * (1 + fb), rev = amount * ask * (1 - ms);
+    const sp = (ask / (sb.bids[0]?.[0] || ask) - 1) * 100;
+    out.push({ side: 'venda', bookSpreadPct: sp, makerExchangeFee: ms, limitPrice: ask, cost, revenue: rev, net: rev - cost, netPct: (rev - cost) / cost * 100 }); }
+  for (const o of out) o.realistic = o.bookSpreadPct <= MAKER_MAX_SPREAD;
+  out.sort((a, b) => (b.realistic - a.realistic) || (b.net - a.net));
+  return out[0] || null;
 }
 
 // preço médio para encher `amount` no livro (inclui slippage real) e o pior preço tocado
@@ -168,6 +196,7 @@ async function quote(buyId, sellId, symbol, amount) {
   const fb = takerFee(bx, symbol), fs_ = takerFee(sx, symbol);
   const r = calcRoute(bb, sb, fb, fs_, amount);
   if (!r) return null;
+  const mb = makerFee(bx, symbol), ms = makerFee(sx, symbol), mv = makerVariant(bb, sb, fb, fs_, mb, ms, amount);
   // maior quantidade (até MAX_ORDER_QUOTE) que ainda dá lucro líquido >= mínimo, com os livros atuais
   // tamanho (até MAX_ORDER_QUOTE) que dá o MAIOR lucro em USDT com lucro líquido >= mínimo
   const hiAmt = MAX_ORDER_QUOTE / Math.max(bb.asks[0]?.[0] || 1, 1e-9);
@@ -182,7 +211,9 @@ async function quote(buyId, sellId, symbol, amount) {
     buyPrice: r.buy.avg, sellPrice: r.sell.avg, buyLimit: r.buy.worst, sellLimit: r.sell.worst,
     grossPct: (r.sell.avg / r.buy.avg - 1) * 100,
     netPct: r.netPct, netProfit: r.net, quote: q,
-    fees: { buy: fb, sell: fs_ },
+    fees: { buy: fb, sell: fs_, buyMaker: mb, sellMaker: ms },
+    maker: mv ? { side: mv.side, limitPrice: mv.limitPrice, bookSpreadPct: mv.bookSpreadPct, realistic: mv.realistic, invest: mv.cost, revenue: mv.revenue, netProfit: mv.net, netPct: mv.netPct, meetsMin: mv.netPct >= MIN_PROFIT_PCT,
+      note: `Ordem limitada na ${mv.side} a ${mv.limitPrice} — só lucra se for executada; a outra ponta a mercado` } : null,
     // previsão em valores, antes de qualquer ordem
     preview: {
       invest: r.cost, revenue: r.revenue, grossProfit: r.gross - r.spend,
@@ -361,6 +392,13 @@ app.get('/api/opportunities', wrap(async (req, res) => {
   try { oppCache.data = await oppCache.pending; oppCache.at = Date.now(); } finally { oppCache.pending = null; }
   res.json(oppCache.data);
 }));
+let makerCache = { at: 0, list: [] };
+// comparação taker × maker (simulação): as 20 rotas com maior lucro usando ordem maker numa ponta
+app.get('/api/maker-opportunities', wrap(async (req, res) => {
+  if (Date.now() - makerCache.at > 15000) await scanOpps(Number(req.query.amount) || DEFAULT_AMOUNT, true);
+  res.json({ ok: true, minProfitPct: MIN_PROFIT_PCT, simulation: true, opportunities: makerCache.list.map(q => ({ id: q.id, symbol: q.symbol, buyExchange: q.buyExchange, sellExchange: q.sellExchange, amount: q.amount,
+    taker: { netPct: q.netPct, netProfit: q.netProfit }, maker: q.maker, fees: q.fees })) });
+}));
 async function scanOpps(amount, all) {
   const list = [];
   for (const symbol of SYMBOLS) {
@@ -369,8 +407,9 @@ async function scanOpps(amount, all) {
     const pairs = [];
     for (const a of ids) for (const b of ids) if (a !== b) pairs.push([a, b]);
     const qs = await Promise.all(pairs.map(([a, b]) => quote(a, b, symbol, amount).catch(() => null)));
-    for (const q of qs) if (q && (all || q.netPct > 0)) list.push({ id: `${symbol}:${q.buyExchange}>${q.sellExchange}`, ...q });
+    for (const q of qs) if (q && (all || q.netPct > 0 || q.maker?.netPct > 0)) list.push({ id: `${symbol}:${q.buyExchange}>${q.sellExchange}`, ...q });
   }
+  makerCache = { at: Date.now(), list: list.filter(q => q.maker).sort((x, y) => (y.maker.realistic - x.maker.realistic) || (y.maker.netProfit - x.maker.netProfit)).slice(0, 20) };
   // ordena pelo lucro em USDT: primeiro o maior lucro possível, depois o lucro na quantidade base
   list.sort((x, y) => (y.preview.maxNetProfit - x.preview.maxNetProfit) || (y.netProfit - x.netProfit));
   return { ok: true, minProfitPct: MIN_PROFIT_PCT, opportunities: list.slice(0, 20) };
