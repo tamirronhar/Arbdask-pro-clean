@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -198,6 +198,62 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '50kb' }));
 app.use(cors({ origin: ALLOWED_ORIGINS.includes('*') ? true : ALLOWED_ORIGINS }));
+// ---------- VIGILÂNCIA DEX (só leitura, sem carteira) ----------
+// Compara o USDC/USDT das corretoras com a KyberSwap em redes baratas. Avisa quando a diferença líquida de gás
+// passa de DEX_ALERT_PCT (0,3% por defeito), que já paga as transferências. Não envia nada para a blockchain.
+const DEX_ALERT_PCT = Number(process.env.DEX_ALERT_PCT ?? 0.3), DEX_AMOUNT = Number(process.env.DEX_AMOUNT ?? 200), DEX_EVERY_MIN = Number(process.env.DEX_EVERY_MIN ?? 2);
+const DEX_CHAINS = {
+  bsc: { USDC: ['0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', 18], USDT: ['0x55d398326f99059fF775485246999027B3197955', 18] },
+  polygon: { USDC: ['0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', 6], USDT: ['0xc2132D05D31c914a87C6611C10748AEb04B58e8F', 6] },
+  base: { USDC: ['0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', 6], USDT: ['0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2', 6] },
+  arbitrum: { USDC: ['0xaf88d065e77c8cC2239327C5EDb3A432268e5831', 6], USDT: ['0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', 6] }
+};
+const dexWatch = { at: null, amount: DEX_AMOUNT, alertPct: DEX_ALERT_PCT, cex: null, routes: [], best: null, alerts: [], error: null };
+async function kyberQuote(chain, from, to, amount) {
+  const [ai, di] = DEX_CHAINS[chain][from], [ao] = DEX_CHAINS[chain][to];
+  const amt = BigInt(Math.round(amount * 1e6)) * 10n ** BigInt(di - 6);
+  const r = await fetch(`https://aggregator-api.kyberswap.com/${chain}/api/v1/routes?tokenIn=${ai}&tokenOut=${ao}&amountIn=${amt}`, { headers: { 'x-client-id': 'jet7' } });
+  if (!r.ok) throw new Error('KyberSwap ' + chain + ' ' + r.status);
+  const d = (await r.json())?.data?.routeSummary; if (!d) throw new Error('KyberSwap ' + chain + ' sem rota');
+  const dout = DEX_CHAINS[chain][to][1];
+  return { out: Number(BigInt(d.amountOut) / 10n ** BigInt(Math.max(dout - 6, 0))) / 1e6, gasUsd: Number(d.gasUsd) || 0 };
+}
+async function cexUsdcRef() {
+  let bid = null, ask = null;
+  for (const id of EXCHANGES) {
+    if (!(await supports(id, 'USDC/USDT').catch(() => false))) continue;
+    try { const ob = await client(id).fetchOrderBook('USDC/USDT', 20); const b = ob.bids[0]?.[0], a = ob.asks[0]?.[0];
+      if (b && (!bid || b > bid.price)) bid = { exchange: id, price: b, fee: takerFee(client(id), 'USDC/USDT') };
+      if (a && (!ask || a < ask.price)) ask = { exchange: id, price: a, fee: takerFee(client(id), 'USDC/USDT') }; } catch (e) {}
+  }
+  return { bid, ask };
+}
+async function dexWatchTick() {
+  try {
+    const cex = await cexUsdcRef(); if (!cex.bid || !cex.ask) throw new Error('Sem preço USDC/USDT nas corretoras');
+    const A = DEX_AMOUNT, routes = [];
+    await Promise.all(Object.keys(DEX_CHAINS).map(async chain => {
+      try {
+        // CEX→DEX: compra USDC na corretora, troca USDC→USDT na DEX
+        const s1 = await kyberQuote(chain, 'USDC', 'USDT', A);
+        const cost1 = A * cex.ask.price * (1 + cex.ask.fee);
+        routes.push({ route: `Comprar USDC na ${cex.ask.exchange} → vender na KyberSwap (${chain})`, chain, dir: 'CEX→DEX', grossPct: (s1.out / (A * cex.ask.price) - 1) * 100, netPct: ((s1.out - s1.gasUsd) / cost1 - 1) * 100, netUsdt: s1.out - s1.gasUsd - cost1, gasUsd: s1.gasUsd });
+        // DEX→CEX: troca USDT→USDC na DEX, vende USDC na corretora
+        const s2 = await kyberQuote(chain, 'USDT', 'USDC', A);
+        const rev2 = s2.out * cex.bid.price * (1 - cex.bid.fee);
+        routes.push({ route: `Comprar USDC na KyberSwap (${chain}) → vender na ${cex.bid.exchange}`, chain, dir: 'DEX→CEX', grossPct: (s2.out * cex.bid.price / A - 1) * 100, netPct: ((rev2 - s2.gasUsd) / A - 1) * 100, netUsdt: rev2 - s2.gasUsd - A, gasUsd: s2.gasUsd });
+      } catch (e) {}
+    }));
+    routes.sort((a, b) => b.netPct - a.netPct);
+    Object.assign(dexWatch, { at: new Date().toISOString(), cex, routes, best: routes[0] || null, error: null });
+    for (const r of routes) if (r.netPct >= DEX_ALERT_PCT) { dexWatch.alerts.unshift({ at: dexWatch.at, ...r }); console.log(`ALERTA DEX: ${r.route} ${r.netPct.toFixed(3)}%`); }
+    dexWatch.alerts = dexWatch.alerts.slice(0, 50);
+  } catch (e) { dexWatch.error = e.message; }
+}
+setTimeout(dexWatchTick, 15000); setInterval(dexWatchTick, DEX_EVERY_MIN * 60000);
+// só dados públicos de mercado (sem saldos nem chaves): pode ser lido sem token, para alertas externos
+app.get('/public/dex-watch', (req, res) => res.json({ ok: true, version: VERSION, ...dexWatch, routes: dexWatch.routes.map(r => ({ ...r, grossPct: +r.grossPct.toFixed(4), netPct: +r.netPct.toFixed(4), netUsdt: +r.netUsdt.toFixed(4) })) }));
+
 app.use('/api', (req, res, next) => {
   const h = req.headers.authorization || '';
   const t = h.startsWith('Bearer ') ? h.slice(7) : '';
