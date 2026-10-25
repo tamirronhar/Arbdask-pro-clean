@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.9.2';
+const VERSION = '1.9.3';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -215,11 +215,21 @@ function calcRoute(bb, sb, fb, fs_, amount) {
   return { buy, sell, spend, feeBuy, gross, feeSell, cost, revenue, net, netPct: (net / cost) * 100 };
 }
 
+// livro partilhado: cada corretora+par é lido uma vez a cada 3 s, mesmo que entre em várias rotas (menos memória e pedidos)
+const bookCache = new Map();
+function bookOf(id, symbol) {
+  const k = id + '|' + symbol, c = bookCache.get(k);
+  if (c && Date.now() - c.at < 3000) return c.p;
+  const p = client(id).fetchOrderBook(symbol, 20).then(ob => ({ bids: ob.bids.slice(0, 20), asks: ob.asks.slice(0, 20), timestamp: ob.timestamp }));
+  bookCache.set(k, { at: Date.now(), p }); p.catch(() => bookCache.delete(k));
+  if (bookCache.size > 300) for (const [kk, v] of bookCache) if (Date.now() - v.at > 10000) bookCache.delete(kk);
+  return p;
+}
 async function quote(buyId, sellId, symbol, amount) {
   const bx = client(buyId), sx = client(sellId);
   await Promise.all([ensureMarkets(bx), ensureMarkets(sx)]);
   await Promise.all([refreshFees(buyId), refreshFees(sellId)]);
-  const [bb, sb] = await Promise.all([bx.fetchOrderBook(symbol, 20), sx.fetchOrderBook(symbol, 20)]);
+  const [bb, sb] = await Promise.all([bookOf(buyId, symbol), bookOf(sellId, symbol)]);
   const fb = takerFee(bx, symbol), fs_ = takerFee(sx, symbol);
   const r = calcRoute(bb, sb, fb, fs_, amount);
   if (!r) return null;
@@ -773,7 +783,7 @@ async function quoteTransfer(buyId, sellId, symbol, amount) {
   const nets = commonNets(curA, curB, base);
   if (!nets.length) return null;
   const net = nets[0];
-  const [bb, sb] = await Promise.all([bx.fetchOrderBook(symbol, 20), sx.fetchOrderBook(symbol, 20)]);
+  const [bb, sb] = await Promise.all([bookOf(buyId, symbol), bookOf(sellId, symbol)]);
   const fb = takerFee(bx, symbol), fs_ = takerFee(sx, symbol);
   const r = calcTransfer(bb, sb, fb, fs_, amount, net.fee);
   if (!r) return null;
