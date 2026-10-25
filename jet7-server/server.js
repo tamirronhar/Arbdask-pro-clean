@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.2.9';
+const VERSION = '1.3.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -207,7 +207,7 @@ const wrap = fn => (req, res) => fn(req, res).catch(e => res.status(500).json({ 
 
 app.get('/api/health', wrap(async (req, res) => {
   res.json({ ok: true, version: VERSION, dryRun: DRY_RUN, feeDiscount: FEE_DISCOUNT ? FEE_MULT : false, stopped: STOPPED, symbols: SYMBOLS,
-    minProfitPct: MIN_PROFIT_PCT, maxOrderQuote: MAX_ORDER_QUOTE,
+    minProfitPct: MIN_PROFIT_PCT, maxOrderQuote: MAX_ORDER_QUOTE, historySync: { enabled: histSync.enabled, gist: !!gistId, lastOk: histSync.lastOk, lastError: histSync.lastError },
     exchanges: EXCHANGES.map(id => ({ id, keys: hasKeys(id) })) });
 }));
 
@@ -318,7 +318,52 @@ async function scanOpps(amount, all) {
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-function record(t) { const h = readJSON(HIST_FILE, []); h.unshift({ at: new Date().toISOString(), ...t }); writeJSON(HIST_FILE, h.slice(0, 1000)); }
+function record(t) { const h = readJSON(HIST_FILE, []); h.unshift({ at: new Date().toISOString(), ...t }); writeJSON(HIST_FILE, h.slice(0, 1000)); scheduleHistSync(); }
+
+// histórico persistente num Gist privado do GitHub (o disco do Render Free apaga-se a cada deploy).
+// Ativo só com GITHUB_TOKEN (token com permissão Gists: leitura e escrita). GIST_ID é opcional: o servidor encontra ou cria o gist.
+const GH_TOKEN = (process.env.GITHUB_TOKEN || '').trim();
+const GIST_FILE = 'jet7-history.json';
+let gistId = (process.env.GIST_ID || '').trim(), histSync = { enabled: !!GH_TOKEN, lastOk: null, lastError: null }, syncTimer = null;
+async function gh(pathname, opts = {}) {
+  const r = await fetch('https://api.github.com' + pathname, { ...opts, headers: { Authorization: 'Bearer ' + GH_TOKEN, Accept: 'application/vnd.github+json', 'User-Agent': 'jet7-server', 'Content-Type': 'application/json' } });
+  if (!r.ok) throw new Error('GitHub ' + r.status + ': ' + (await r.text()).slice(0, 160));
+  return r.json();
+}
+async function findOrCreateGist() {
+  if (gistId) return gistId;
+  for (let page = 1; page <= 5 && !gistId; page++) {
+    const list = await gh('/gists?per_page=100&page=' + page);
+    const g = list.find(x => x.files && x.files[GIST_FILE]); if (g) gistId = g.id;
+    if (list.length < 100) break;
+  }
+  if (!gistId) gistId = (await gh('/gists', { method: 'POST', body: JSON.stringify({ description: 'JET7 histórico (privado)', public: false, files: { [GIST_FILE]: { content: '[]' } } }) })).id;
+  return gistId;
+}
+async function loadHistFromGist() {
+  if (!GH_TOKEN) return;
+  try {
+    const g = await gh('/gists/' + await findOrCreateGist());
+    const f = g.files[GIST_FILE]; let remote = [];
+    if (f) remote = JSON.parse(f.truncated ? await (await fetch(f.raw_url)).text() : (f.content || '[]'));
+    const local = readJSON(HIST_FILE, []), seen = new Set(), merged = [];
+    for (const t of [...local, ...remote]) { const k = t.at + '|' + (t.id || t.symbol || ''); if (!seen.has(k)) { seen.add(k); merged.push(t); } }
+    merged.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+    writeJSON(HIST_FILE, merged.slice(0, 1000)); histSync.lastOk = new Date().toISOString(); histSync.lastError = null;
+    console.log(`Histórico carregado do Gist: ${merged.length} registos`);
+  } catch (e) { histSync.lastError = e.message; console.warn('Gist: ' + e.message); }
+}
+function scheduleHistSync() {
+  if (!GH_TOKEN) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(async () => {
+    try {
+      await gh('/gists/' + await findOrCreateGist(), { method: 'PATCH', body: JSON.stringify({ files: { [GIST_FILE]: { content: JSON.stringify(readJSON(HIST_FILE, []), null, 1) } } }) });
+      histSync.lastOk = new Date().toISOString(); histSync.lastError = null;
+    } catch (e) { histSync.lastError = e.message; console.warn('Gist: ' + e.message); }
+  }, 3000);
+}
+loadHistFromGist();
 
 // PREVISÃO: quanto se ganha nesta rota antes de executar (não envia ordens)
 app.get('/api/preview', wrap(async (req, res) => {
