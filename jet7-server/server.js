@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.2.5';
+const VERSION = '1.2.6';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -92,7 +92,7 @@ async function supports(id, symbol) {
 // desconto de taxa por pagar com o token da corretora (BNB, KCS, MX, GT). Só afeta o cálculo/simulação.
 // FEE_DISCOUNT=false desliga; FEE_DISCOUNTS=binance:0.75,kucoin:0.8,... substitui os multiplicadores.
 const FEE_DISCOUNT = String(process.env.FEE_DISCOUNT ?? 'true').toLowerCase() !== 'false';
-const FEE_MULT = Object.assign({ binance: 0.75, kucoin: 0.8, mexc: 0.8, gate: 0.9 },
+const FEE_MULT = Object.assign({ binance: 0.75, kucoin: 0.8, mexc: 0.8, gate: 0.9, bitget: 0.8 },
   Object.fromEntries((process.env.FEE_DISCOUNTS || '').split(',').map(x => x.split(':').map(y => y.trim()))
     .filter(([k, v]) => k && !isNaN(Number(v))).map(([k, v]) => [k, Number(v)])));
 function takerFee(ex, symbol) {
@@ -184,6 +184,21 @@ app.post('/api/gate/gt-fee', wrap(async (req, res) => {
   await client('gate').privateAccountPostDebitFee({ enabled });
   const r = await client('gate').privateAccountGetDebitFee();
   res.json({ ok: true, gate: r });
+}));
+
+// desconto BGB na Bitget (taxa spot -20% pagando em BGB). Só muda a forma de pagar a taxa.
+async function bitgetDeduct(method, body) {
+  return client('bitget').request(method === 'GET' ? 'v2/spot/account/deduct-info' : 'v2/spot/account/switch-deduct', ['private', 'spot'], method, body || {});
+}
+app.get('/api/bitget/bgb-fee', wrap(async (req, res) => {
+  if (!hasKeys('bitget')) return res.status(400).json({ ok: false, error: 'Bitget sem chave' });
+  res.json({ ok: true, bitget: await bitgetDeduct('GET') });
+}));
+app.post('/api/bitget/bgb-fee', wrap(async (req, res) => {
+  if (!hasKeys('bitget')) return res.status(400).json({ ok: false, error: 'Bitget sem chave' });
+  const deduct = req.body?.enabled === false ? 'off' : 'on';
+  const r = await bitgetDeduct('POST', { deduct });
+  res.json({ ok: true, result: r, bitget: await bitgetDeduct('GET') });
 }));
 
 app.post('/api/keys', wrap(async (req, res) => {
