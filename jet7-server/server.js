@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.2.7';
+const VERSION = '1.2.8';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -95,9 +95,40 @@ const FEE_DISCOUNT = String(process.env.FEE_DISCOUNT ?? 'true').toLowerCase() !=
 const FEE_MULT = Object.assign({ binance: 0.75, kucoin: 0.8, mexc: 0.8, gate: 0.9, bitget: 0.8 },
   Object.fromEntries((process.env.FEE_DISCOUNTS || '').split(',').map(x => x.split(':').map(y => y.trim()))
     .filter(([k, v]) => k && !isNaN(Number(v))).map(([k, v]) => [k, Number(v)])));
+// taxas reais da conta (lidas pela API de cada corretora, cache 6h). Sem chave ou se falhar: taxa geral do mercado.
+const FEE_TTL = 6 * 3600 * 1000;
+const accountFees = {}; // id -> { at, fees: {symbol: taker}, error }
+const feeInflight = {};
+function refreshFees(id) {
+  if (!feeInflight[id]) feeInflight[id] = _refreshFees(id).finally(() => { delete feeInflight[id]; });
+  return feeInflight[id];
+}
+async function _refreshFees(id) {
+  const c = accountFees[id];
+  if (c && Date.now() - c.at < (c.error ? 600000 : FEE_TTL)) return;
+  if (!hasKeys(id)) return;
+  const ex = client(id), fees = {};
+  try {
+    await ensureMarkets(ex);
+    const syms = SYMBOLS.filter(s => ex.markets[s]);
+    if (ex.has.fetchTradingFees) {
+      const all = await ex.fetchTradingFees();
+      for (const s of syms) if (all[s] && typeof all[s].taker === 'number') fees[s] = all[s].taker;
+    }
+    if (ex.has.fetchTradingFee) {
+      for (const s of syms.filter(s => fees[s] === undefined)) {
+        try { const f = await ex.fetchTradingFee(s); if (typeof f.taker === 'number') fees[s] = f.taker; } catch (e) {}
+      }
+    }
+    accountFees[id] = { at: Date.now(), fees };
+  } catch (e) {
+    accountFees[id] = { at: Date.now(), fees: accountFees[id]?.fees || {}, error: e.message.slice(0, 160) };
+  }
+}
 function takerFee(ex, symbol) {
   const m = ex.markets && ex.markets[symbol];
-  const base = m && typeof m.taker === 'number' ? m.taker : 0.001;
+  const real = accountFees[ex.id]?.fees?.[symbol];
+  const base = typeof real === 'number' ? Math.abs(real) : (m && typeof m.taker === 'number' ? m.taker : 0.001);
   return FEE_DISCOUNT && FEE_MULT[ex.id] ? base * FEE_MULT[ex.id] : base;
 }
 
@@ -125,6 +156,7 @@ function calcRoute(bb, sb, fb, fs_, amount) {
 async function quote(buyId, sellId, symbol, amount) {
   const bx = client(buyId), sx = client(sellId);
   await Promise.all([ensureMarkets(bx), ensureMarkets(sx)]);
+  await Promise.all([refreshFees(buyId), refreshFees(sellId)]);
   const [bb, sb] = await Promise.all([bx.fetchOrderBook(symbol, 20), sx.fetchOrderBook(symbol, 20)]);
   const fb = takerFee(bx, symbol), fs_ = takerFee(sx, symbol);
   const r = calcRoute(bb, sb, fb, fs_, amount);
@@ -206,6 +238,20 @@ app.post('/api/bitget/bgb-fee', wrap(async (req, res) => {
   const deduct = req.body?.enabled === false ? 'off' : 'on';
   const r = await bitgetDeduct('POST', { deduct });
   res.json({ ok: true, result: r, bitget: await bitgetDeduct('GET') });
+}));
+
+app.get('/api/fees', wrap(async (req, res) => {
+  const ids = EXCHANGES.filter(hasKeys);
+  await Promise.all(ids.map(refreshFees));
+  const out = {};
+  for (const id of ids) {
+    const ex = client(id); out[id] = { error: accountFees[id]?.error, source: {}, effective: {} };
+    for (const s of SYMBOLS) if (ex.markets && ex.markets[s]) {
+      out[id].source[s] = typeof accountFees[id]?.fees?.[s] === 'number' ? 'conta' : 'mercado';
+      out[id].effective[s] = +(takerFee(ex, s) * 100).toFixed(4);
+    }
+  }
+  res.json({ ok: true, feesPct: out });
 }));
 
 app.post('/api/keys', wrap(async (req, res) => {
