@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -504,12 +504,193 @@ app.get('/api/inventory', wrap(async (req, res) => {
     note: 'Reequilibrar só quando necessário, pela rede mais barata (ex.: BEP20 / TRC20 conforme a moeda), e de preferência em lote.' });
 }));
 
+// ---------- ROTA COM TRANSFERÊNCIA (método Arb Desk) ----------
+// Compra a moeda na corretora A, pede o endereço de depósito na B, saca pela rede mais barata em comum,
+// espera o depósito, recalcula e só vende na B se ainda houver lucro (senão mantém a moeda, sem prejuízo).
+// O lucro já desconta a taxa de saque da rede. Em DRY_RUN só simula; em real precisa de chaves com SAQUE
+// (de preferência com lista branca de endereços) nas corretoras de origem.
+const NET_TTL = 30 * 60000;
+const TRANSFER_TIMEOUT_MIN = Number(process.env.TRANSFER_TIMEOUT_MIN ?? 30);
+const netCache = {}; // id -> { at, cur, error }
+const NET_ALIAS = { OPTIMISM: 'OP', 'AVAXC-CHAIN': 'AVAXC', AVAX_C: 'AVAXC', BSC: 'BEP20', TRX: 'TRC20', ETH: 'ERC20', POLYGON: 'MATIC', ARB: 'ARBITRUM', ARBONE: 'ARBITRUM', KAVAEVM: 'KAVAEVM' };
+const normNet = n => { const u = String(n || '').toUpperCase(); return NET_ALIAS[u] || u; };
+async function networksOf(id) {
+  const c = netCache[id];
+  if (c && Date.now() - c.at < (c.error ? 300000 : NET_TTL)) return c.cur;
+  const ex = client(id); let cur = {};
+  try {
+    cur = await ex.fetchCurrencies() || {};
+    const codes = [...new Set(SYMBOLS.map(x => x.split('/')[0]))];
+    const missing = codes.some(code => Object.values(cur[code]?.networks || {}).some(n => typeof n.fee !== 'number'));
+    if (missing && ex.has.fetchDepositWithdrawFees && hasKeys(id)) {
+      try {
+        const f = await ex.fetchDepositWithdrawFees(codes);
+        for (const code of codes) for (const [net, v] of Object.entries(f[code]?.networks || {})) {
+          const w = v?.withdraw?.fee; if (typeof w !== 'number') continue;
+          cur[code] = cur[code] || { networks: {} }; cur[code].networks = cur[code].networks || {};
+          const k = Object.keys(cur[code].networks).find(x => normNet(x) === normNet(net)) || net;
+          cur[code].networks[k] = { ...(cur[code].networks[k] || {}), fee: w };
+        }
+      } catch (e) {}
+    }
+    netCache[id] = { at: Date.now(), cur };
+  } catch (e) { netCache[id] = { at: Date.now(), cur: c?.cur || {}, error: e.message.slice(0, 160) }; }
+  return netCache[id].cur;
+}
+// redes em comum: saque ativo em A, depósito ativo em B, taxa de saque conhecida; a mais barata primeiro
+function commonNets(curA, curB, code) {
+  const a = curA[code]?.networks || {}, b = curB[code]?.networks || {};
+  const bMap = {}; for (const [k, v] of Object.entries(b)) bMap[normNet(k)] = { key: k, ...v };
+  const out = [];
+  for (const [k, v] of Object.entries(a)) {
+    const nb = bMap[normNet(k)];
+    if (!nb || v.withdraw === false || v.active === false || nb.deposit === false || nb.active === false || typeof v.fee !== 'number') continue;
+    out.push({ network: normNet(k), netA: k, netB: nb.key, fee: v.fee, min: v.limits?.withdraw?.min ?? null });
+  }
+  return out.sort((x, y) => x.fee - y.fee);
+}
+function calcTransfer(bb, sb, fb, fs_, amount, wfee) {
+  const buy = walk(bb.asks, amount); if (!buy) return null;
+  const got = amount * (1 - fb) - wfee;       // taxa de compra cobrada na moeda + taxa de saque
+  if (got <= 0) return null;
+  const sell = walk(sb.bids, got); if (!sell) return null;
+  const cost = amount * buy.avg, revenue = got * sell.avg * (1 - fs_), net = revenue - cost;
+  return { buy, sell, got, cost, revenue, net, netPct: net / cost * 100, feesTotal: cost * fb + wfee * buy.avg + got * sell.avg * fs_ };
+}
+async function quoteTransfer(buyId, sellId, symbol, amount) {
+  const [base, q] = symbol.split('/');
+  const bx = client(buyId), sx = client(sellId);
+  await Promise.all([ensureMarkets(bx), ensureMarkets(sx), refreshFees(buyId), refreshFees(sellId)]);
+  const [curA, curB] = await Promise.all([networksOf(buyId), networksOf(sellId)]);
+  const nets = commonNets(curA, curB, base);
+  if (!nets.length) return null;
+  const net = nets[0];
+  const [bb, sb] = await Promise.all([bx.fetchOrderBook(symbol, 20), sx.fetchOrderBook(symbol, 20)]);
+  const fb = takerFee(bx, symbol), fs_ = takerFee(sx, symbol);
+  const r = calcTransfer(bb, sb, fb, fs_, amount, net.fee);
+  if (!r) return null;
+  const hiAmt = MAX_ORDER_QUOTE / Math.max(bb.asks[0]?.[0] || 1, 1e-9);
+  let best = null, bestAmt = 0;
+  for (let i = 1; i <= 40; i++) {
+    const amt = hiAmt * i / 40; if (net.min && amt < net.min) continue;
+    const m = calcTransfer(bb, sb, fb, fs_, amt, net.fee);
+    if (m && m.netPct >= MIN_PROFIT_PCT && (!best || m.net > best.net)) { best = m; bestAmt = amt; }
+  }
+  return {
+    type: 'transfer', symbol, buyExchange: buyId, sellExchange: sellId, amount, quote: q,
+    network: net.network, withdrawFee: net.fee, withdrawMin: net.min, otherNetworks: nets.slice(1, 4).map(n => ({ network: n.network, fee: n.fee })),
+    buyPrice: r.buy.avg, sellPrice: r.sell.avg, buyLimit: r.buy.worst, sellLimit: r.sell.worst,
+    grossPct: (r.sell.avg / r.buy.avg - 1) * 100, netPct: r.netPct, netProfit: r.net, fees: { buy: fb, sell: fs_ },
+    steps: ['VERIFICAR PREÇOS', 'VERIFICAR SALDO', `COMPRAR ${base} na ${buyId}`, `ENDEREÇO DE DEPÓSITO na ${sellId} (${net.network}, taxa ${net.fee} ${base})`, 'SAQUE', 'AGUARDAR DEPÓSITO', 'RECALCULAR ROTA', `VENDER ${base} na ${sellId}`],
+    preview: { invest: r.cost, revenue: r.revenue, feesTotal: r.feesTotal, netProfit: r.net, netPct: r.netPct, meetsMin: r.netPct >= MIN_PROFIT_PCT, minProfitPct: MIN_PROFIT_PCT,
+      maxAmount: best ? bestAmt : 0, maxInvest: best ? best.cost : 0, maxNetProfit: best ? best.net : 0 }
+  };
+}
+async function scanTransfers(amount, all) {
+  const list = [];
+  for (const symbol of SYMBOLS) {
+    const ids = [];
+    for (const id of EXCHANGES) if (await supports(id, symbol)) ids.push(id);
+    const pairs = []; for (const a of ids) for (const b of ids) if (a !== b) pairs.push([a, b]);
+    const qs = await Promise.all(pairs.map(([a, b]) => quoteTransfer(a, b, symbol, amount).catch(() => null)));
+    for (const q of qs) if (q && (all || q.netPct > 0)) list.push({ id: `T:${symbol}:${q.buyExchange}>${q.sellExchange}`, ...q });
+  }
+  list.sort((x, y) => (y.preview.maxNetProfit - x.preview.maxNetProfit) || (y.netProfit - x.netProfit));
+  return { ok: true, type: 'transfer', minProfitPct: MIN_PROFIT_PCT, opportunities: list.slice(0, 20) };
+}
+app.get('/api/transfer-opportunities', wrap(async (req, res) => res.json(await scanTransfers(Number(req.query.amount) || DEFAULT_AMOUNT, req.query.all === '1'))));
+app.get('/api/networks', wrap(async (req, res) => {
+  const code = String(req.query.coin || 'USDT').toUpperCase(), ids = EXCHANGES.filter(id => !(marketFail[id] && Date.now() - marketFail[id] < 60000));
+  const out = {};
+  await Promise.all(ids.map(async id => { const c = await networksOf(id); out[id] = Object.entries(c[code]?.networks || {}).map(([k, v]) => ({ network: normNet(k), fee: v.fee ?? null, withdraw: v.withdraw !== false, deposit: v.deposit !== false })).sort((a, b) => (a.fee ?? 1e9) - (b.fee ?? 1e9)); }));
+  res.json({ ok: true, coin: code, networks: out });
+}));
+
+// execução da rota com transferência: corre em segundo plano (o depósito pode demorar minutos)
+const transferJobs = new Map();
+function jobStep(job, step, info) { job.steps.push({ at: new Date().toISOString(), step, info }); job.current = step; }
+async function executeTransfer(input) {
+  if (STOPPED) return { code: 423, body: { ok: false, status: 'aborted', message: 'Bot parado pelo botão de emergência' } };
+  const { buyExchange, sellExchange, symbol } = input, source = input.source || 'manual';
+  const amount = Number(input.amount);
+  if (!EXCHANGES.includes(buyExchange) || !EXCHANGES.includes(sellExchange) || buyExchange === sellExchange) return { code: 400, body: { ok: false, error: 'Corretoras inválidas' } };
+  if (!SYMBOLS.includes(symbol)) return { code: 400, body: { ok: false, error: 'Par não permitido' } };
+  if (!(amount > 0)) return { code: 400, body: { ok: false, error: 'Quantidade inválida' } };
+  const q = await quoteTransfer(buyExchange, sellExchange, symbol, amount);
+  if (!q) return { code: 200, body: { ok: true, status: 'aborted', message: 'Sem rede em comum ou livro sem profundidade' } };
+  if (q.amount * q.buyPrice > MAX_ORDER_QUOTE) return { code: 400, body: { ok: false, status: 'aborted', message: `Acima do limite por operação (${MAX_ORDER_QUOTE} ${q.quote})` } };
+  if (q.netPct < MIN_PROFIT_PCT) { const t = { type: 'transfer', status: 'held', symbol, buyExchange, sellExchange, amount, netProfit: 0, lastNetPct: q.netPct, network: q.network }; record({ source, ...t }); return { code: 200, body: { ok: true, ...t, message: `Lucro ${q.netPct.toFixed(3)}% abaixo do mínimo depois da taxa de saque — nada executado` } }; }
+  if (DRY_RUN) {
+    const t = { type: 'transfer', status: 'dry_run', symbol, buyExchange, sellExchange, amount, network: q.network, withdrawFee: q.withdrawFee, netProfit: q.netProfit, netPct: q.netPct, steps: q.steps, preview: q.preview };
+    record({ source, ...t });
+    return { code: 200, body: { ok: true, ...t, message: `Simulação: ${q.steps.join(' → ')} · lucro líquido ${q.netProfit.toFixed(4)} ${q.quote} (${q.netPct.toFixed(3)}%) — nada enviado (DRY_RUN)` } };
+  }
+  if (!hasKeys(buyExchange) || !hasKeys(sellExchange)) return { code: 400, body: { ok: false, error: 'Faltam chaves API nas duas corretoras' } };
+  const job = { id: crypto.randomBytes(6).toString('hex'), type: 'transfer', source, symbol, buyExchange, sellExchange, amount, network: q.network, status: 'running', steps: [], startedAt: new Date().toISOString() };
+  transferJobs.set(job.id, job);
+  runTransferJob(job, q).catch(e => { job.status = 'error'; job.error = e.message; jobStep(job, 'ERRO', e.message); record({ source, type: 'transfer', status: 'error', symbol, buyExchange, sellExchange, amount, netProfit: 0, message: e.message, steps: job.steps }); STOPPED = true; });
+  return { code: 202, body: { ok: true, status: 'running', jobId: job.id, message: 'Rota com transferência iniciada — acompanhe em /api/transfer-jobs/' + job.id } };
+}
+async function runTransferJob(job, q) {
+  const { buyExchange, sellExchange, symbol, amount } = job, [base, quoteCur] = symbol.split('/');
+  const bx = client(buyExchange), sx = client(sellExchange);
+  jobStep(job, 'VERIFICAR SALDO');
+  const bBal = await bx.fetchBalance();
+  if ((bBal.free[quoteCur] ?? 0) < amount * q.buyLimit * 1.002) { job.status = 'aborted'; jobStep(job, 'CANCELADO', `Saldo insuficiente de ${quoteCur} na ${buyExchange}`); record({ source: job.source, type: 'transfer', status: 'aborted', symbol, buyExchange, sellExchange, amount, netProfit: 0, message: 'Saldo insuficiente' }); return; }
+  jobStep(job, 'ENDEREÇO DE DEPÓSITO');
+  const curB = await networksOf(sellExchange), curA = await networksOf(buyExchange);
+  const net = commonNets(curA, curB, base).find(n => n.network === q.network);
+  if (!net) throw new Error('Rede ' + q.network + ' deixou de estar disponível');
+  const addr = await sx.fetchDepositAddress(base, { network: net.netB });
+  if (!addr?.address) throw new Error('Sem endereço de depósito na ' + sellExchange);
+  jobStep(job, 'COMPRAR CRIPTO');
+  const f = await quoteTransfer(buyExchange, sellExchange, symbol, amount);
+  if (!f || f.netPct < MIN_PROFIT_PCT) { job.status = 'held'; jobStep(job, 'MANTIDO', 'Lucro desapareceu antes de comprar — nada executado'); record({ source: job.source, type: 'transfer', status: 'held', symbol, buyExchange, sellExchange, amount, netProfit: 0 }); return; }
+  const amt = Number(bx.amountToPrecision(symbol, amount));
+  const o = await bx.createOrder(symbol, 'limit', 'buy', amt, Number(bx.priceToPrecision(symbol, f.buyLimit)), { timeInForce: 'IOC' });
+  const bought = o.filled || 0;
+  if (!(bought > 0)) { job.status = 'aborted'; jobStep(job, 'CANCELADO', 'Compra não executou (preço mudou) — sem perda'); record({ source: job.source, type: 'transfer', status: 'aborted', symbol, buyExchange, sellExchange, amount, netProfit: 0 }); return; }
+  const cost = o.cost ?? bought * (o.average ?? f.buyPrice);
+  await sleep(1500);
+  const freeBase = (await bx.fetchBalance()).free[base] ?? bought;
+  const sendAmt = Math.min(bought, freeBase);
+  jobStep(job, 'SAQUE', `${sendAmt} ${base} via ${net.network} (taxa ${net.fee})`);
+  const w = await bx.withdraw(base, sendAmt, addr.address, addr.tag, { network: net.netA });
+  job.withdrawId = w?.id;
+  jobStep(job, 'AGUARDAR DEPÓSITO');
+  const before = (await sx.fetchBalance()).free[base] ?? 0, expect = sendAmt - net.fee, deadline = Date.now() + TRANSFER_TIMEOUT_MIN * 60000;
+  let arrived = false;
+  while (Date.now() < deadline) {
+    await sleep(20000);
+    const now = (await sx.fetchBalance()).free[base] ?? 0;
+    if (now - before >= expect * 0.98) { arrived = true; break; }
+  }
+  if (!arrived) { job.status = 'waiting_deposit'; jobStep(job, 'DEPÓSITO ATRASADO', `Ainda não chegou após ${TRANSFER_TIMEOUT_MIN} min — Autobot parado até verificar`); STOPPED = true; record({ source: job.source, type: 'transfer', status: 'waiting_deposit', symbol, buyExchange, sellExchange, amount: bought, netProfit: 0, withdrawId: job.withdrawId }); return; }
+  const floor = cost / (expect * (1 - takerFee(sx, symbol)));  // preço mínimo de venda sem prejuízo
+  for (let i = 1; i <= MAX_ATTEMPTS * 2; i++) {
+    jobStep(job, 'RECALCULAR ROTA', 'tentativa ' + i);
+    const ob = await sx.fetchOrderBook(symbol, 20), wk = walk(ob.bids, expect);
+    if (wk && wk.worst >= floor) {
+      jobStep(job, 'VENDER');
+      const so = await sx.createOrder(symbol, 'limit', 'sell', Number(sx.amountToPrecision(symbol, expect)), Number(sx.priceToPrecision(symbol, wk.worst)), { timeInForce: 'IOC' });
+      const rev = (so.cost ?? (so.filled || 0) * (so.average ?? wk.avg)) * (1 - takerFee(sx, symbol));
+      if ((so.filled || 0) > 0) { const profit = rev - cost * ((so.filled || 0) / expect); job.status = 'executed'; job.netProfit = profit; jobStep(job, 'CONCLUÍDO', `lucro ${profit.toFixed(4)} ${quoteCur}`); record({ source: job.source, type: 'transfer', status: 'executed', symbol, buyExchange, sellExchange, amount: bought, network: net.network, netProfit: profit, steps: job.steps }); return; }
+    }
+    await sleep(15000 * i);
+  }
+  job.status = 'held_coin'; jobStep(job, 'MANTIDO', `Venda sem lucro neste momento — ${base} fica na ${sellExchange} (sem vender abaixo do custo)`);
+  record({ source: job.source, type: 'transfer', status: 'held_coin', symbol, buyExchange, sellExchange, amount: bought, netProfit: 0 });
+}
+app.post('/api/execute-transfer', wrap(async (req, res) => { const r = await executeTransfer({ ...(req.body || {}), source: 'manual' }); res.status(r.code).json(r.body); }));
+app.get('/api/transfer-jobs/:id', wrap(async (req, res) => { const j = transferJobs.get(req.params.id); if (!j) return res.status(404).json({ ok: false, error: 'Não encontrado' }); res.json({ ok: true, job: j }); }));
+app.get('/api/transfer-jobs', wrap(async (req, res) => res.json({ ok: true, jobs: [...transferJobs.values()].slice(-20).reverse() })));
+
 // ---------- AUTOBOT 24h no servidor ----------
 // Corre sozinho com a configuração definida: procura a rota com maior lucro em USDT e executa-a
 // pela mesma função do clique manual (recálculo, reverificação, anti-perda). Em DRY_RUN só simula.
 const AUTOBOT_FILE = path.join(DATA_DIR, 'autobot.json');
 const GIST_AUTOBOT = 'jet7-autobot.json';
-const AUTOBOT_DEFAULT = { enabled: false, amount: DEFAULT_AMOUNT, minProfitUsdt: 0, intervalSec: 45, cooldownSec: 120, symbols: [], exchanges: [] };
+const AUTOBOT_DEFAULT = { enabled: false, routeTypes: ['simultanea', 'transferencia'], amount: DEFAULT_AMOUNT, minProfitUsdt: 0, intervalSec: 45, cooldownSec: 120, symbols: [], exchanges: [] };
 let autobot = { ...AUTOBOT_DEFAULT, ...readJSON(AUTOBOT_FILE, {}) };
 const autoState = { running: false, lastScanAt: null, lastScanMs: null, lastBest: null, lastAction: null, lastError: null, trades: 0, simulated: 0, profitUsdt: 0, startedAt: null };
 const routeCooldown = new Map();
@@ -523,6 +704,7 @@ function sanitizeAutobot(c) {
   if (c.intervalSec != null) o.intervalSec = Math.min(Math.max(Number(c.intervalSec) || 45, 20), 3600);
   if (c.cooldownSec != null) o.cooldownSec = Math.min(Math.max(Number(c.cooldownSec) || 0, 0), 86400);
   if (Array.isArray(c.symbols)) o.symbols = c.symbols.filter(x => SYMBOLS.includes(x));
+  if (Array.isArray(c.routeTypes)) o.routeTypes = c.routeTypes.filter(x => ['simultanea', 'transferencia'].includes(x));
   if (Array.isArray(c.exchanges)) o.exchanges = c.exchanges.filter(x => EXCHANGES.includes(x));
   return o;
 }
@@ -546,11 +728,16 @@ async function autobotTick() {
   if (STOPPED) { autoState.lastAction = { at: new Date().toISOString(), status: 'paused', message: 'Botão de emergência ativo' }; return; }
   autoState.running = true; const t0 = Date.now();
   try {
-    const data = await scanOpps(autobot.amount, false);
+    const types = autobot.routeTypes && autobot.routeTypes.length ? autobot.routeTypes : ['simultanea'];
+    const parts = await Promise.all([
+      types.includes('simultanea') ? scanOpps(autobot.amount, false) : { opportunities: [] },
+      types.includes('transferencia') && ![...transferJobs.values()].some(j => j.status === 'running') ? scanTransfers(autobot.amount, false) : { opportunities: [] }
+    ]);
+    const data = { opportunities: parts[0].opportunities.concat(parts[1].opportunities).sort((x, y) => (y.preview.maxNetProfit - x.preview.maxNetProfit) || (y.netProfit - x.netProfit)) };
     autoState.lastScanAt = new Date().toISOString(); autoState.lastScanMs = Date.now() - t0;
     const now = Date.now();
     const cands = data.opportunities.filter(o =>
-      o.preview.meetsMin && o.netProfit >= autobot.minProfitUsdt &&
+      (o.preview.meetsMin || (o.preview.maxNetProfit > 0 && o.preview.maxAmount <= autobot.amount)) && Math.max(o.netProfit, o.preview.maxNetProfit) >= autobot.minProfitUsdt &&
       (!autobot.symbols.length || autobot.symbols.includes(o.symbol)) &&
       (!autobot.exchanges.length || (autobot.exchanges.includes(o.buyExchange) && autobot.exchanges.includes(o.sellExchange))) &&
       (DRY_RUN || (hasKeys(o.buyExchange) && hasKeys(o.sellExchange))) &&
@@ -558,11 +745,13 @@ async function autobotTick() {
     autoState.lastBest = data.opportunities[0] ? { id: data.opportunities[0].id, netPct: data.opportunities[0].netPct, netProfit: data.opportunities[0].netProfit, maxNetProfit: data.opportunities[0].preview.maxNetProfit } : null;
     if (!cands.length) { autoState.lastAction = { at: autoState.lastScanAt, status: 'waiting', message: 'Nenhuma rota acima do mínimo' }; return; }
     for (const o of cands.slice(0, 3)) {
-      const r = await executeRoute({ buyExchange: o.buyExchange, sellExchange: o.sellExchange, symbol: o.symbol, amount: autobot.amount, source: 'autobot' });
+      const args = { buyExchange: o.buyExchange, sellExchange: o.sellExchange, symbol: o.symbol, amount: o.preview.maxAmount > 0 ? Math.min(o.preview.maxAmount, autobot.amount) : autobot.amount, source: 'autobot' };
+      const r = o.type === 'transfer' ? await executeTransfer(args) : await executeRoute(args);
       const b = r.body || {};
       autoState.lastAction = { at: new Date().toISOString(), route: o.id, status: b.status || (b.ok ? 'ok' : 'error'), netProfit: b.netProfit ?? 0, message: b.message || b.error };
       if (b.status === 'aborted' && /Saldo insuficiente/.test(b.message || '')) { routeCooldown.set(o.id, Date.now() + 10 * 60000); continue; }
       routeCooldown.set(o.id, Date.now() + autobot.cooldownSec * 1000);
+      if (b.status === 'running') { autoState.trades++; break; }
       if (b.status === 'executed') { autoState.trades++; autoState.profitUsdt += b.netProfit || 0; }
       if (b.status === 'dry_run') { autoState.simulated++; autoState.profitUsdt += b.netProfit || 0; }
       break;
