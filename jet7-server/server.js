@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.8.0';
+const VERSION = '1.9.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -610,6 +610,92 @@ app.get('/api/inventory', wrap(async (req, res) => {
     note: 'Reequilibrar só quando necessário, pela rede mais barata (ex.: BEP20 / TRC20 conforme a moeda), e de preferência em lote.' });
 }));
 
+
+// ---------- EXECUÇÃO MAKER NUMA PONTA ----------
+// 1) põe uma ordem limitada (post-only, fica no livro) no melhor preço da ponta maker;
+// 2) espera até MAKER_WAIT_SEC que alguém a execute, verificando sempre se a outra ponta ainda dá lucro (senão cancela);
+// 3) o que for executado é logo fechado na outra corretora a mercado (IOC com preço-limite sem prejuízo).
+// Em DRY_RUN não envia ordens: segue os negócios públicos e só conta como executada se houver negócios ao nosso preço.
+const MAKER_WAIT_SEC = Number(process.env.MAKER_WAIT_SEC ?? 60);
+async function executeMaker(input) {
+  const send = (code, body) => ({ code, body });
+  const source = input.source || 'manual';
+  if (STOPPED) return send(423, { ok: false, status: 'aborted', message: 'Bot parado pelo botão de emergência' });
+  const { buyExchange, sellExchange, symbol } = input, amount = Number(input.amount);
+  if (!EXCHANGES.includes(buyExchange) || !EXCHANGES.includes(sellExchange) || buyExchange === sellExchange) return send(400, { ok: false, error: 'Corretoras inválidas' });
+  if (!SYMBOLS.includes(symbol)) return send(400, { ok: false, error: 'Par não permitido' });
+  if (!(amount > 0)) return send(400, { ok: false, error: 'Quantidade inválida' });
+  if (!DRY_RUN && (!hasKeys(buyExchange) || !hasKeys(sellExchange))) return send(400, { ok: false, error: 'Faltam chaves API nas duas corretoras' });
+  const q = await quote(buyExchange, sellExchange, symbol, amount);
+  if (!q || !q.maker) return send(200, { ok: true, status: 'aborted', message: 'Livro sem profundidade suficiente' });
+  if (amount * q.buyPrice > MAX_ORDER_QUOTE) return send(400, { ok: false, status: 'aborted', message: `Acima do limite por operação (${MAX_ORDER_QUOTE})` });
+  const m = q.maker, [base, quoteCur] = symbol.split('/');
+  if (!m.realistic || m.netPct < MIN_PROFIT_PCT) { const t = { type: 'maker', status: 'held', symbol, buyExchange, sellExchange, amount, netProfit: 0, lastNetPct: m.netPct }; record({ source, ...t }); return send(200, { ok: true, ...t, message: `Maker ${m.netPct.toFixed(3)}% abaixo do mínimo — nada enviado` }); }
+  const bx = client(buyExchange), sx = client(sellExchange);
+  const mx = m.side === 'compra' ? bx : sx, tx = m.side === 'compra' ? sx : bx;   // corretora maker / corretora taker
+  const makerSide = m.side === 'compra' ? 'buy' : 'sell';
+  const fM = m.side === 'compra' ? q.fees.buyMaker : q.fees.sellMaker, fT = m.side === 'compra' ? q.fees.sell : q.fees.buy;
+  // preço-limite da ponta taker que ainda dá lucro mínimo face ao nosso preço maker
+  const takerLimit = m.side === 'compra' ? m.limitPrice * (1 + fM) * (1 + MIN_PROFIT_PCT / 100) / (1 - fT) : m.limitPrice * (1 - fM) / ((1 + fT) * (1 + MIN_PROFIT_PCT / 100));
+  const stillOk = async () => { const ob = await tx.fetchOrderBook(symbol, 20); const w = walk(m.side === 'compra' ? ob.bids : ob.asks, amount); return w && (m.side === 'compra' ? w.worst >= takerLimit : w.worst <= takerLimit); };
+  const t0 = Date.now(), deadline = t0 + MAKER_WAIT_SEC * 1000;
+  let filled = 0, order = null, cancelled = null;
+  if (DRY_RUN) {
+    // simulação: conta como executada a quantidade negociada publicamente ao nosso preço (ou melhor para quem nos vende/compra)
+    let since = t0;
+    // fila à nossa frente: quantidade que já estava nesse preço (essa é executada antes da nossa)
+    let ahead = 0; try { const ob0 = await mx.fetchOrderBook(symbol, 20); const lv = (makerSide === 'buy' ? ob0.bids : ob0.asks).find(([p]) => p === m.limitPrice); ahead = lv ? lv[1] : 0; } catch (e) {}
+    while (Date.now() < deadline && filled < amount) {
+      await sleep(5000);
+      if (!(await stillOk().catch(() => false))) { cancelled = 'outra ponta deixou de dar lucro'; break; }
+      try {
+        const tr = await mx.fetchTrades(symbol, since);
+        for (const x of tr) { if (x.timestamp < since) continue; const hit = makerSide === 'buy' ? (x.side === 'sell' && x.price <= m.limitPrice) : (x.side === 'buy' && x.price >= m.limitPrice); if (!hit) continue; const better = makerSide === 'buy' ? x.price < m.limitPrice : x.price > m.limitPrice; let a = x.amount; if (!better) { const use = Math.min(ahead, a); ahead -= use; a -= use; } filled += a; }
+        if (tr.length) since = Math.max(since, ...tr.map(x => x.timestamp + 1));
+      } catch (e) {}
+    }
+    filled = Math.min(filled, amount);
+  } else {
+    // saldo nos dois lados
+    const [bBal, sBal] = await Promise.all([bx.fetchBalance(), sx.fetchBalance()]);
+    if ((bBal.free[quoteCur] ?? 0) < amount * q.buyLimit * 1.002 || (sBal.free[base] ?? 0) < amount)
+      return send(200, { ok: true, status: 'aborted', netProfit: 0, message: `Saldo insuficiente: precisa de ${quoteCur} na ${buyExchange} e ${base} na ${sellExchange}` });
+    const amt = Number(mx.amountToPrecision(symbol, amount));
+    order = await mx.createOrder(symbol, 'limit', makerSide, amt, Number(mx.priceToPrecision(symbol, m.limitPrice)), { postOnly: true });
+    while (Date.now() < deadline) {
+      await sleep(3000);
+      const o = await mx.fetchOrder(order.id, symbol).catch(() => null); if (o) filled = o.filled || 0;
+      if (filled >= amt * 0.999 || (o && o.status === 'closed')) break;
+      if (o && o.status === 'canceled') { cancelled = 'corretora cancelou (post-only)'; break; }
+      if (!(await stillOk().catch(() => false))) { cancelled = 'outra ponta deixou de dar lucro'; break; }
+    }
+    try { await mx.cancelOrder(order.id, symbol); } catch (e) {}
+    const o = await mx.fetchOrder(order.id, symbol).catch(() => null); if (o) filled = o.filled || filled;
+  }
+  // fechar o que foi executado na outra corretora
+  let closed = 0, closeOrder = null, profit = 0;
+  if (filled > 0) {
+    const ob = await tx.fetchOrderBook(symbol, 20), w = walk(m.side === 'compra' ? ob.bids : ob.asks, filled);
+    const px = w ? w.avg : null;
+    if (DRY_RUN) { if (w) closed = filled; }
+    else if (w) {
+      const lim = m.side === 'compra' ? Math.max(w.worst, m.limitPrice * (1 + fM) / (1 - fT)) : Math.min(w.worst, m.limitPrice * (1 - fM) / (1 + fT));
+      closeOrder = await tx.createOrder(symbol, 'limit', m.side === 'compra' ? 'sell' : 'buy', Number(tx.amountToPrecision(symbol, filled)), Number(tx.priceToPrecision(symbol, lim)), { timeInForce: 'IOC' });
+      closed = closeOrder.filled || 0;
+    }
+    if (px && closed > 0) profit = m.side === 'compra' ? closed * (px * (1 - fT) - m.limitPrice * (1 + fM)) : closed * (m.limitPrice * (1 - fM) - px * (1 + fT));
+    if (!DRY_RUN && Math.abs(filled - closed) > filled * 0.01) setStopped(true);
+  }
+  const status = filled <= 0 ? 'not_filled' : Math.abs(filled - closed) > filled * 0.01 ? 'partial' : (DRY_RUN ? 'dry_run' : 'executed');
+  const t = { type: 'maker', status, symbol, buyExchange, sellExchange, makerSide: m.side, limitPrice: m.limitPrice, amount, filled, closed, netProfit: profit, expectedNetProfit: m.netProfit, waitedSec: Math.round((Date.now() - t0) / 1000), cancelled };
+  record({ source, ...t });
+  const msg = status === 'not_filled' ? `Ordem maker não foi executada em ${t.waitedSec}s${cancelled ? ' (' + cancelled + ')' : ''} — sem perda` :
+    status === 'partial' ? `Desequilíbrio: executou ${filled} e fechou ${closed} ${base}. Bot parado — verifique os saldos.` :
+    `${DRY_RUN ? 'Simulação' : 'Executado'}: ${filled.toFixed(4)} ${base} com ordem maker na ${m.side} → lucro ${profit.toFixed(4)} ${quoteCur}${filled < amount ? ' (execução parcial)' : ''}`;
+  return send(200, { ok: true, ...t, message: msg });
+}
+app.post('/api/execute-maker', wrap(async (req, res) => { const r = await executeMaker({ ...(req.body || {}), source: 'manual' }); res.status(r.code).json(r.body); }));
+
 // ---------- ROTA COM TRANSFERÊNCIA (método Arb Desk) ----------
 // Compra a moeda na corretora A, pede o endereço de depósito na B, saca pela rede mais barata em comum,
 // espera o depósito, recalcula e só vende na B se ainda houver lucro (senão mantém a moeda, sem prejuízo).
@@ -797,7 +883,7 @@ app.get('/api/transfer-jobs', wrap(async (req, res) => res.json({ ok: true, jobs
 // pela mesma função do clique manual (recálculo, reverificação, anti-perda). Em DRY_RUN só simula.
 const AUTOBOT_FILE = path.join(DATA_DIR, 'autobot.json');
 const GIST_AUTOBOT = 'jet7-autobot.json';
-const AUTOBOT_DEFAULT = { enabled: false, routeTypes: ['simultanea', 'transferencia'], amount: DEFAULT_AMOUNT, minProfitUsdt: 0, intervalSec: 45, cooldownSec: 120, symbols: [], exchanges: [] };
+const AUTOBOT_DEFAULT = { enabled: false, useMaker: false, routeTypes: ['simultanea', 'transferencia'], amount: DEFAULT_AMOUNT, minProfitUsdt: 0, intervalSec: 45, cooldownSec: 120, symbols: [], exchanges: [] };
 let autobot = { ...AUTOBOT_DEFAULT, ...readJSON(AUTOBOT_FILE, {}) };
 const autoState = { running: false, lastScanAt: null, lastScanMs: null, lastBest: null, lastAction: null, lastError: null, trades: 0, simulated: 0, profitUsdt: 0, startedAt: null };
 const routeCooldown = new Map();
@@ -806,6 +892,7 @@ let autoTimer = null;
 function sanitizeAutobot(c) {
   const o = { ...autobot };
   if (typeof c.enabled === 'boolean') o.enabled = c.enabled;
+  if (typeof c.useMaker === 'boolean') o.useMaker = c.useMaker;
   if (c.amount != null) o.amount = Math.min(Math.max(Number(c.amount) || DEFAULT_AMOUNT, 1), MAX_ORDER_QUOTE);
   if (c.minProfitUsdt != null) o.minProfitUsdt = Math.max(Number(c.minProfitUsdt) || 0, 0);
   if (c.intervalSec != null) o.intervalSec = Math.min(Math.max(Number(c.intervalSec) || 45, 20), 3600);
@@ -840,11 +927,12 @@ async function autobotTick() {
       types.includes('simultanea') ? scanOpps(autobot.amount, false) : { opportunities: [] },
       types.includes('transferencia') && ![...transferJobs.values()].some(j => j.status === 'running') ? scanTransfers(autobot.amount, false) : { opportunities: [] }
     ]);
-    const data = { opportunities: parts[0].opportunities.concat(parts[1].opportunities).sort((x, y) => (y.preview.maxNetProfit - x.preview.maxNetProfit) || (y.netProfit - x.netProfit)) };
+    const score = o => Math.max(o.preview.maxNetProfit, autobot.useMaker && o.maker?.realistic ? o.maker.netProfit : 0);
+    const data = { opportunities: parts[0].opportunities.concat(parts[1].opportunities).sort((x, y) => (score(y) - score(x)) || (y.netProfit - x.netProfit)) };
     autoState.lastScanAt = new Date().toISOString(); autoState.lastScanMs = Date.now() - t0;
     const now = Date.now();
     const cands = data.opportunities.filter(o =>
-      (o.preview.meetsMin || (o.preview.maxNetProfit > 0 && o.preview.maxAmount <= autobot.amount)) && Math.max(o.netProfit, o.preview.maxNetProfit) >= autobot.minProfitUsdt &&
+      (o.preview.meetsMin || (autobot.useMaker && o.type !== 'transfer' && o.maker?.realistic && o.maker.netPct >= MIN_PROFIT_PCT) || (o.preview.maxNetProfit > 0 && o.preview.maxAmount <= autobot.amount)) && Math.max(o.netProfit, o.preview.maxNetProfit) >= autobot.minProfitUsdt &&
       (!autobot.symbols.length || autobot.symbols.includes(o.symbol)) &&
       (!autobot.exchanges.length || (autobot.exchanges.includes(o.buyExchange) && autobot.exchanges.includes(o.sellExchange))) &&
       (DRY_RUN || (hasKeys(o.buyExchange) && hasKeys(o.sellExchange))) &&
@@ -853,13 +941,16 @@ async function autobotTick() {
     if (!cands.length) { autoState.lastAction = { at: autoState.lastScanAt, status: 'waiting', message: 'Nenhuma rota acima do mínimo' }; return; }
     for (const o of cands.slice(0, 3)) {
       const args = { buyExchange: o.buyExchange, sellExchange: o.sellExchange, symbol: o.symbol, amount: o.preview.maxAmount > 0 ? Math.min(o.preview.maxAmount, autobot.amount) : autobot.amount, source: 'autobot' };
-      const r = o.type === 'transfer' ? await executeTransfer(args) : await executeRoute(args);
+      const useMk = autobot.useMaker && o.type !== 'transfer' && o.maker?.realistic && o.maker.netProfit > o.netProfit && o.maker.netPct >= MIN_PROFIT_PCT;
+      if (useMk) args.amount = autobot.amount;
+      const r = o.type === 'transfer' ? await executeTransfer(args) : useMk ? await executeMaker(args) : await executeRoute(args);
       const b = r.body || {};
       autoState.lastAction = { at: new Date().toISOString(), route: o.id, status: b.status || (b.ok ? 'ok' : 'error'), netProfit: b.netProfit ?? 0, message: b.message || b.error };
       if (b.status === 'aborted' && /Saldo insuficiente/.test(b.message || '')) { routeCooldown.set(o.id, Date.now() + 10 * 60000); continue; }
       routeCooldown.set(o.id, Date.now() + autobot.cooldownSec * 1000);
       if (b.status === 'running') { autoState.trades++; break; }
       if (b.status === 'executed') { autoState.trades++; autoState.profitUsdt += b.netProfit || 0; }
+      if (b.status === 'not_filled') { autoState.lastAction.message = b.message; break; }
       if (b.status === 'dry_run') { autoState.simulated++; autoState.profitUsdt += b.netProfit || 0; }
       break;
     }
