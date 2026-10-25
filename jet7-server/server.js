@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.9.0';
+const VERSION = '1.9.1';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -917,16 +917,19 @@ async function loadAutobotFromGist() {
   } catch (e) { console.warn('Gist autobot: ' + e.message); }
 }
 
+const TRANSFER_SCAN_MIN = Number(process.env.TRANSFER_SCAN_MIN ?? 15); let lastTransferScan = 0;
 async function autobotTick() {
   if (!autobot.enabled || autoState.running) return;
   if (STOPPED) { autoState.lastAction = { at: new Date().toISOString(), status: 'paused', message: 'Botão de emergência ativo' }; return; }
   autoState.running = true; const t0 = Date.now();
   try {
     const types = autobot.routeTypes && autobot.routeTypes.length ? autobot.routeTypes : ['simultanea'];
-    const parts = await Promise.all([
-      types.includes('simultanea') ? scanOpps(autobot.amount, false) : { opportunities: [] },
-      types.includes('transferencia') && ![...transferJobs.values()].some(j => j.status === 'running') ? scanTransfers(autobot.amount, false) : { opportunities: [] }
-    ]);
+    // em sequência (não em paralelo) e transferências só a cada TRANSFER_SCAN_MIN minutos — o Render Free tem 512 MB
+    const p0 = types.includes('simultanea') ? await scanOpps(autobot.amount, false) : { opportunities: [] };
+    const doT = types.includes('transferencia') && Date.now() - lastTransferScan > TRANSFER_SCAN_MIN * 60000 && ![...transferJobs.values()].some(j => j.status === 'running');
+    if (doT) lastTransferScan = Date.now();
+    const p1 = doT ? await scanTransfers(autobot.amount, false) : { opportunities: [] };
+    const parts = [p0, p1];
     const score = o => Math.max(o.preview.maxNetProfit, autobot.useMaker && o.maker?.realistic ? o.maker.netProfit : 0);
     const data = { opportunities: parts[0].opportunities.concat(parts[1].opportunities).sort((x, y) => (score(y) - score(x)) || (y.netProfit - x.netProfit)) };
     autoState.lastScanAt = new Date().toISOString(); autoState.lastScanMs = Date.now() - t0;
