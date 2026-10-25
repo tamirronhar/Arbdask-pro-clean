@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.7.2';
+const VERSION = '1.8.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -101,9 +101,19 @@ const FEE_TTL = 6 * 3600 * 1000;
 const accountFees = {}; // id -> { at, fees: {symbol: taker}, error }
 const feeInflight = {};
 function refreshFees(id) {
-  if (!feeInflight[id]) feeInflight[id] = _refreshFees(id).finally(() => { delete feeInflight[id]; });
+  if (!feeInflight[id]) feeInflight[id] = Promise.all([_refreshFees(id), refreshToken(id)]).finally(() => { delete feeInflight[id]; });
   return feeInflight[id];
 }
+// o desconto por token só conta se houver saldo desse token na corretora (lido a cada 10 min)
+const FEE_TOKEN = { binance: 'BNB', kucoin: 'KCS', mexc: 'MX', gate: 'GT', bitget: 'BGB' };
+const tokenBal = {}; // id -> { at, amount, error }
+async function refreshToken(id) {
+  const t = FEE_TOKEN[id], c = tokenBal[id];
+  if (!t || !hasKeys(id) || (c && Date.now() - c.at < 600000)) return;
+  try { const b = await client(id).fetchBalance(); tokenBal[id] = { at: Date.now(), amount: Number(b.free?.[t] ?? b.total?.[t] ?? 0) }; }
+  catch (e) { tokenBal[id] = { at: Date.now(), amount: c?.amount ?? 0, error: e.message.slice(0, 120) }; }
+}
+const discountOn = id => FEE_DISCOUNT && !!FEE_MULT[id] && (tokenBal[id]?.amount || 0) > 0;
 async function _refreshFees(id) {
   const c = accountFees[id];
   if (c && Date.now() - c.at < (c.error ? 600000 : FEE_TTL)) return;
@@ -137,7 +147,7 @@ function takerFee(ex, symbol) {
   const base = typeof real === 'number' ? Math.abs(real) : (m && typeof m.taker === 'number' ? m.taker : 0.001);
   // a Gate já devolve a taxa com desconto GT quando está ligado (gt_taker_fee): não aplicar o desconto duas vezes
   const already = typeof real === 'number' && ex.id === 'gate' && accountFees.gate?.gtDiscount;
-  return FEE_DISCOUNT && FEE_MULT[ex.id] && !already ? base * FEE_MULT[ex.id] : base;
+  return discountOn(ex.id) && !already ? base * FEE_MULT[ex.id] : base;
 }
 
 
@@ -147,7 +157,7 @@ function makerFee(ex, symbol) {
   const real = accountFees[ex.id]?.makers?.[symbol];
   const base = typeof real === 'number' ? real : (m && typeof m.maker === 'number' ? m.maker : takerFee(ex, symbol));
   const already = typeof real === 'number' && ex.id === 'gate' && accountFees.gate?.gtDiscount;
-  return FEE_DISCOUNT && FEE_MULT[ex.id] && !already && base > 0 ? base * FEE_MULT[ex.id] : base;
+  return discountOn(ex.id) && !already && base > 0 ? base * FEE_MULT[ex.id] : base;
 }
 // SIMULAÇÃO maker numa ponta: (A) compra com ordem limitada no melhor bid da corretora de compra e vende a mercado,
 // ou (B) compra a mercado e vende com ordem limitada no melhor ask da corretora de venda. Escolhe a melhor.
@@ -296,7 +306,7 @@ app.use('/api', (req, res, next) => {
 const wrap = fn => (req, res) => fn(req, res).catch(e => res.status(500).json({ ok: false, error: e.message }));
 
 app.get('/api/health', wrap(async (req, res) => {
-  res.json({ ok: true, version: VERSION, dryRun: DRY_RUN, feeDiscount: FEE_DISCOUNT ? FEE_MULT : false, stopped: STOPPED, symbols: SYMBOLS,
+  res.json({ ok: true, version: VERSION, dryRun: DRY_RUN, feeDiscount: FEE_DISCOUNT ? Object.fromEntries(Object.keys(FEE_TOKEN).map(id => [id, { token: FEE_TOKEN[id], balance: tokenBal[id]?.amount ?? null, active: discountOn(id), mult: FEE_MULT[id] }])) : false, stopped: STOPPED, symbols: SYMBOLS,
     minProfitPct: MIN_PROFIT_PCT, maxOrderQuote: MAX_ORDER_QUOTE, autobot: { enabled: autobot.enabled, lastScanAt: autoState.lastScanAt, simulated: autoState.simulated, trades: autoState.trades }, historySync: { enabled: histSync.enabled, gist: !!gistId, lastOk: histSync.lastOk, lastError: histSync.lastError },
     exchanges: EXCHANGES.map(id => ({ id, keys: hasKeys(id) })) });
 }));
