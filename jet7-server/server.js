@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.2.8';
+const VERSION = '1.2.9';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -108,19 +108,24 @@ async function _refreshFees(id) {
   if (c && Date.now() - c.at < (c.error ? 600000 : FEE_TTL)) return;
   if (!hasKeys(id)) return;
   const ex = client(id), fees = {};
+  let gtDiscount = false;
   try {
     await ensureMarkets(ex);
     const syms = SYMBOLS.filter(s => ex.markets[s]);
     if (ex.has.fetchTradingFees) {
       const all = await ex.fetchTradingFees();
       for (const s of syms) if (all[s] && typeof all[s].taker === 'number') fees[s] = all[s].taker;
+      if (id === 'gate') gtDiscount = Object.values(all).some(f => f?.info?.gt_discount === true);
     }
     if (ex.has.fetchTradingFee) {
       for (const s of syms.filter(s => fees[s] === undefined)) {
         try { const f = await ex.fetchTradingFee(s); if (typeof f.taker === 'number') fees[s] = f.taker; } catch (e) {}
       }
     }
-    accountFees[id] = { at: Date.now(), fees };
+    if (id === 'gate' && !gtDiscount) {
+      for (const s of syms) { try { const f = await ex.fetchTradingFee(s); if (f?.info?.gt_discount === true) { gtDiscount = true; } break; } catch (e) { break; } }
+    }
+    accountFees[id] = { at: Date.now(), fees, gtDiscount };
   } catch (e) {
     accountFees[id] = { at: Date.now(), fees: accountFees[id]?.fees || {}, error: e.message.slice(0, 160) };
   }
@@ -129,7 +134,9 @@ function takerFee(ex, symbol) {
   const m = ex.markets && ex.markets[symbol];
   const real = accountFees[ex.id]?.fees?.[symbol];
   const base = typeof real === 'number' ? Math.abs(real) : (m && typeof m.taker === 'number' ? m.taker : 0.001);
-  return FEE_DISCOUNT && FEE_MULT[ex.id] ? base * FEE_MULT[ex.id] : base;
+  // a Gate já devolve a taxa com desconto GT quando está ligado (gt_taker_fee): não aplicar o desconto duas vezes
+  const already = typeof real === 'number' && ex.id === 'gate' && accountFees.gate?.gtDiscount;
+  return FEE_DISCOUNT && FEE_MULT[ex.id] && !already ? base * FEE_MULT[ex.id] : base;
 }
 
 // preço médio para encher `amount` no livro (inclui slippage real) e o pior preço tocado
