@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.3.1';
+const VERSION = '1.4.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -209,7 +209,7 @@ const wrap = fn => (req, res) => fn(req, res).catch(e => res.status(500).json({ 
 
 app.get('/api/health', wrap(async (req, res) => {
   res.json({ ok: true, version: VERSION, dryRun: DRY_RUN, feeDiscount: FEE_DISCOUNT ? FEE_MULT : false, stopped: STOPPED, symbols: SYMBOLS,
-    minProfitPct: MIN_PROFIT_PCT, maxOrderQuote: MAX_ORDER_QUOTE, historySync: { enabled: histSync.enabled, gist: !!gistId, lastOk: histSync.lastOk, lastError: histSync.lastError },
+    minProfitPct: MIN_PROFIT_PCT, maxOrderQuote: MAX_ORDER_QUOTE, autobot: { enabled: autobot.enabled, lastScanAt: autoState.lastScanAt, simulated: autoState.simulated, trades: autoState.trades }, historySync: { enabled: histSync.enabled, gist: !!gistId, lastOk: histSync.lastOk, lastError: histSync.lastError },
     exchanges: EXCHANGES.map(id => ({ id, keys: hasKeys(id) })) });
 }));
 
@@ -383,15 +383,23 @@ app.get('/api/preview', wrap(async (req, res) => {
 }));
 
 app.post('/api/execute', wrap(async (req, res) => {
-  if (STOPPED) return res.status(423).json({ ok: false, status: 'aborted', message: 'Bot parado pelo botão de emergência' });
-  const { buyExchange, sellExchange, symbol } = req.body || {};
-  const amount = Number(req.body?.amount);
+  const r = await executeRoute({ ...(req.body || {}), source: 'manual' });
+  res.status(r.code).json(r.body);
+}));
+
+// EXECUÇÃO DA ROTA COMPLETA (usada pelo clique manual e pelo Autobot)
+async function executeRoute(input) {
+  const send = (code, body) => ({ code, body });
+  const source = input.source || 'manual';
+  if (STOPPED) return send(423, { ok: false, status: 'aborted', message: 'Bot parado pelo botão de emergência' });
+  const { buyExchange, sellExchange, symbol } = input;
+  const amount = Number(input.amount);
   if (!EXCHANGES.includes(buyExchange) || !EXCHANGES.includes(sellExchange) || buyExchange === sellExchange)
-    return res.status(400).json({ ok: false, error: 'Corretoras inválidas' });
-  if (!SYMBOLS.includes(symbol)) return res.status(400).json({ ok: false, error: 'Par não permitido' });
-  if (!(amount > 0)) return res.status(400).json({ ok: false, error: 'Quantidade inválida' });
+    return send(400, { ok: false, error: 'Corretoras inválidas' });
+  if (!SYMBOLS.includes(symbol)) return send(400, { ok: false, error: 'Par não permitido' });
+  if (!(amount > 0)) return send(400, { ok: false, error: 'Quantidade inválida' });
   if (!DRY_RUN && (!hasKeys(buyExchange) || !hasKeys(sellExchange)))
-    return res.status(400).json({ ok: false, error: 'Faltam chaves API nas duas corretoras' });
+    return send(400, { ok: false, error: 'Faltam chaves API nas duas corretoras' });
 
   const [base, quoteCur] = symbol.split('/');
   let last = null;
@@ -402,22 +410,22 @@ app.post('/api/execute', wrap(async (req, res) => {
     last = q;
     if (!q) { await sleep(1500); continue; }
     if (q.amount * q.buyPrice > MAX_ORDER_QUOTE)
-      return res.status(400).json({ ok: false, status: 'aborted', message: `Acima do limite por operação (${MAX_ORDER_QUOTE} ${quoteCur})` });
+      return send(400, { ok: false, status: 'aborted', message: `Acima do limite por operação (${MAX_ORDER_QUOTE} ${quoteCur})` });
 
     // PROTEÇÃO ANTI-PERDA: só avança com lucro líquido acima do mínimo
     if (q.netPct < MIN_PROFIT_PCT) { await sleep(1500 * attempt); continue; }
 
     if (DRY_RUN) {
       const t = { status: 'dry_run', symbol, buyExchange, sellExchange, amount, netProfit: q.netProfit, netPct: q.netPct, attempts: attempt, preview: q.preview };
-      record(t);
-      return res.json({ ok: true, ...t, message: `Simulação: lucro líquido ${q.netProfit.toFixed(4)} ${quoteCur} (${q.netPct.toFixed(3)}%) — nenhuma ordem enviada (DRY_RUN)`, orders: [] });
+      record({ source, ...t });
+      return send(200, { ok: true, ...t, message: `Simulação: lucro líquido ${q.netProfit.toFixed(4)} ${quoteCur} (${q.netPct.toFixed(3)}%) — nenhuma ordem enviada (DRY_RUN)`, orders: [] });
     }
 
     // saldo suficiente nos dois lados (o dinheiro já está em cada corretora)
     const bx = client(buyExchange), sx = client(sellExchange);
     const [bBal, sBal] = await Promise.all([bx.fetchBalance(), sx.fetchBalance()]);
     if ((bBal.free[quoteCur] ?? 0) < amount * q.buyLimit * 1.002 || (sBal.free[base] ?? 0) < amount)
-      return res.json({ ok: true, status: 'aborted', attempts: attempt, netProfit: 0, message: `Saldo insuficiente: precisa de ${quoteCur} na ${buyExchange} e ${base} na ${sellExchange}`, orders: [] });
+      return send(200, { ok: true, status: 'aborted', attempts: attempt, netProfit: 0, message: `Saldo insuficiente: precisa de ${quoteCur} na ${buyExchange} e ${base} na ${sellExchange}`, orders: [] });
 
     // REVERIFICAÇÃO FINAL: livros lidos de novo imediatamente antes de enviar as ordens
     const f = await quote(buyExchange, sellExchange, symbol, amount);
@@ -442,17 +450,17 @@ app.post('/api/execute', wrap(async (req, res) => {
     const ok = fb > 0 && Math.abs(fb - fsl) <= amt * 0.01;
     if (!ok && (fb > 0 || fsl > 0)) STOPPED = true; // continua desequilibrada: pára tudo até o utilizador verificar
     const t = { status: ok ? 'executed' : (fb > 0 || fsl > 0) ? 'partial' : 'aborted', symbol, buyExchange, sellExchange, amount: amt, netProfit: ok ? q.netProfit : 0, netPct: q.netPct, attempts: attempt, preview: q.preview, orders };
-    record(t);
-    return res.json({ ok: true, ...t, message: ok
+    record({ source, ...t });
+    return send(200, { ok: true, ...t, message: ok
       ? `Executado: lucro estimado ${q.netProfit.toFixed(4)} ${quoteCur}`
       : (fb > 0 || fsl > 0)
         ? `Desequilíbrio: comprou ${fb} e vendeu ${fsl} ${base}. Bot parado — reequilibre os saldos e volte a ligar o servidor.`
         : 'Nenhuma ordem executou (preço mudou antes) — sem perda' });
   }
   const t = { status: 'held', symbol, buyExchange, sellExchange, amount, netProfit: 0, attempts: MAX_ATTEMPTS, lastNetPct: last?.netPct ?? null };
-  record(t);
-  res.json({ ok: true, ...t, message: `Sem lucro após ${MAX_ATTEMPTS} recálculos — nenhuma ordem enviada, saldo mantido`, orders: [] });
-}));
+  record({ source, ...t });
+  return send(200, { ok: true, ...t, message: `Sem lucro após ${MAX_ATTEMPTS} recálculos — nenhuma ordem enviada, saldo mantido`, orders: [] });
+}
 
 // completa a perna que ficou para trás sem vender abaixo do custo da compra (nem comprar acima da venda)
 async function completeLeg({ bx, sx, symbol, fb, fsl, q }) {
@@ -495,6 +503,91 @@ app.get('/api/inventory', wrap(async (req, res) => {
   res.json({ ok: true, amount, minOps: REBALANCE_MIN_OPS, inventory: out,
     note: 'Reequilibrar só quando necessário, pela rede mais barata (ex.: BEP20 / TRC20 conforme a moeda), e de preferência em lote.' });
 }));
+
+// ---------- AUTOBOT 24h no servidor ----------
+// Corre sozinho com a configuração definida: procura a rota com maior lucro em USDT e executa-a
+// pela mesma função do clique manual (recálculo, reverificação, anti-perda). Em DRY_RUN só simula.
+const AUTOBOT_FILE = path.join(DATA_DIR, 'autobot.json');
+const GIST_AUTOBOT = 'jet7-autobot.json';
+const AUTOBOT_DEFAULT = { enabled: false, amount: DEFAULT_AMOUNT, minProfitUsdt: 0, intervalSec: 45, cooldownSec: 120, symbols: [], exchanges: [] };
+let autobot = { ...AUTOBOT_DEFAULT, ...readJSON(AUTOBOT_FILE, {}) };
+const autoState = { running: false, lastScanAt: null, lastScanMs: null, lastBest: null, lastAction: null, lastError: null, trades: 0, simulated: 0, profitUsdt: 0, startedAt: null };
+const routeCooldown = new Map();
+let autoTimer = null;
+
+function sanitizeAutobot(c) {
+  const o = { ...autobot };
+  if (typeof c.enabled === 'boolean') o.enabled = c.enabled;
+  if (c.amount != null) o.amount = Math.min(Math.max(Number(c.amount) || DEFAULT_AMOUNT, 1), MAX_ORDER_QUOTE);
+  if (c.minProfitUsdt != null) o.minProfitUsdt = Math.max(Number(c.minProfitUsdt) || 0, 0);
+  if (c.intervalSec != null) o.intervalSec = Math.min(Math.max(Number(c.intervalSec) || 45, 20), 3600);
+  if (c.cooldownSec != null) o.cooldownSec = Math.min(Math.max(Number(c.cooldownSec) || 0, 0), 86400);
+  if (Array.isArray(c.symbols)) o.symbols = c.symbols.filter(x => SYMBOLS.includes(x));
+  if (Array.isArray(c.exchanges)) o.exchanges = c.exchanges.filter(x => EXCHANGES.includes(x));
+  return o;
+}
+async function saveAutobot() {
+  writeJSON(AUTOBOT_FILE, autobot);
+  if (!GH_TOKEN) return;
+  try { await gh('/gists/' + await findOrCreateGist(), { method: 'PATCH', body: JSON.stringify({ files: { [GIST_AUTOBOT]: { content: JSON.stringify(autobot, null, 1) } } }) }); }
+  catch (e) { console.warn('Gist autobot: ' + e.message); }
+}
+async function loadAutobotFromGist() {
+  if (!GH_TOKEN) return;
+  try {
+    const g = await gh('/gists/' + await findOrCreateGist());
+    const f = g.files[GIST_AUTOBOT];
+    if (f && f.content) { autobot = { ...AUTOBOT_DEFAULT, ...JSON.parse(f.content) }; writeJSON(AUTOBOT_FILE, autobot); console.log('Autobot carregado do Gist: ' + (autobot.enabled ? 'LIGADO' : 'desligado')); }
+  } catch (e) { console.warn('Gist autobot: ' + e.message); }
+}
+
+async function autobotTick() {
+  if (!autobot.enabled || autoState.running) return;
+  if (STOPPED) { autoState.lastAction = { at: new Date().toISOString(), status: 'paused', message: 'Botão de emergência ativo' }; return; }
+  autoState.running = true; const t0 = Date.now();
+  try {
+    const data = await scanOpps(autobot.amount, false);
+    autoState.lastScanAt = new Date().toISOString(); autoState.lastScanMs = Date.now() - t0;
+    const now = Date.now();
+    const cands = data.opportunities.filter(o =>
+      o.preview.meetsMin && o.netProfit >= autobot.minProfitUsdt &&
+      (!autobot.symbols.length || autobot.symbols.includes(o.symbol)) &&
+      (!autobot.exchanges.length || (autobot.exchanges.includes(o.buyExchange) && autobot.exchanges.includes(o.sellExchange))) &&
+      (DRY_RUN || (hasKeys(o.buyExchange) && hasKeys(o.sellExchange))) &&
+      !((routeCooldown.get(o.id) || 0) > now));
+    autoState.lastBest = data.opportunities[0] ? { id: data.opportunities[0].id, netPct: data.opportunities[0].netPct, netProfit: data.opportunities[0].netProfit, maxNetProfit: data.opportunities[0].preview.maxNetProfit } : null;
+    if (!cands.length) { autoState.lastAction = { at: autoState.lastScanAt, status: 'waiting', message: 'Nenhuma rota acima do mínimo' }; return; }
+    for (const o of cands.slice(0, 3)) {
+      const r = await executeRoute({ buyExchange: o.buyExchange, sellExchange: o.sellExchange, symbol: o.symbol, amount: autobot.amount, source: 'autobot' });
+      const b = r.body || {};
+      autoState.lastAction = { at: new Date().toISOString(), route: o.id, status: b.status || (b.ok ? 'ok' : 'error'), netProfit: b.netProfit ?? 0, message: b.message || b.error };
+      if (b.status === 'aborted' && /Saldo insuficiente/.test(b.message || '')) { routeCooldown.set(o.id, Date.now() + 10 * 60000); continue; }
+      routeCooldown.set(o.id, Date.now() + autobot.cooldownSec * 1000);
+      if (b.status === 'executed') { autoState.trades++; autoState.profitUsdt += b.netProfit || 0; }
+      if (b.status === 'dry_run') { autoState.simulated++; autoState.profitUsdt += b.netProfit || 0; }
+      break;
+    }
+  } catch (e) { autoState.lastError = { at: new Date().toISOString(), message: e.message }; }
+  finally { autoState.running = false; }
+}
+function scheduleAutobot() {
+  clearTimeout(autoTimer);
+  if (!autobot.enabled) return;
+  autoTimer = setTimeout(async () => { await autobotTick(); scheduleAutobot(); }, autobot.intervalSec * 1000);
+}
+function autobotStatus() {
+  return { ok: true, dryRun: DRY_RUN, stopped: STOPPED, config: autobot, state: autoState,
+    message: autobot.enabled ? (DRY_RUN ? 'Autobot ligado em SIMULAÇÃO (DRY_RUN): nenhuma ordem real é enviada' : 'Autobot ligado em MODO REAL') : 'Autobot desligado' };
+}
+app.get('/api/autobot', wrap(async (req, res) => res.json(autobotStatus())));
+app.post('/api/autobot', wrap(async (req, res) => {
+  const was = autobot.enabled;
+  autobot = sanitizeAutobot(req.body || {});
+  if (autobot.enabled && !was) { autoState.startedAt = new Date().toISOString(); autoState.trades = 0; autoState.simulated = 0; autoState.profitUsdt = 0; }
+  await saveAutobot(); scheduleAutobot();
+  res.json(autobotStatus());
+}));
+(async () => { await loadAutobotFromGist(); if (autobot.enabled) { autoState.startedAt = new Date().toISOString(); console.log('Autobot a correr no servidor (24h)'); } scheduleAutobot(); })();
 
 app.post('/api/stop', wrap(async (req, res) => { STOPPED = true; res.json({ ok: true, stopped: true }); }));
 app.post('/api/resume', wrap(async (req, res) => { STOPPED = false; res.json({ ok: true, stopped: false }); }));
