@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.2.6';
+const VERSION = '1.2.7';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -188,7 +188,14 @@ app.post('/api/gate/gt-fee', wrap(async (req, res) => {
 
 // desconto BGB na Bitget (taxa spot -20% pagando em BGB). Só muda a forma de pagar a taxa.
 async function bitgetDeduct(method, body) {
-  return client('bitget').request(method === 'GET' ? 'v2/spot/account/deduct-info' : 'v2/spot/account/switch-deduct', ['private', 'spot'], method, body || {});
+  // conta unificada (UTA) usa v3; conta clássica usa v2
+  const c = client('bitget');
+  try {
+    return method === 'GET' ? await c.privateUtaGetV3AccountDeductInfo() : await c.privateUtaPostV3AccountSwitchDeduct(body || {});
+  } catch (e) {
+    if (!/40084|not.*unified|classic/i.test(e.message)) throw e;
+    return c.request(method === 'GET' ? 'v2/spot/account/deduct-info' : 'v2/spot/account/switch-deduct', ['private', 'spot'], method, body || {});
+  }
 }
 app.get('/api/bitget/bgb-fee', wrap(async (req, res) => {
   if (!hasKeys('bitget')) return res.status(400).json({ ok: false, error: 'Bitget sem chave' });
