@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.9.4';
+const VERSION = '1.9.5';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -56,16 +56,18 @@ function setStopped(v) { STOPPED = !!v; try { autobot.stopped = STOPPED; saveAut
 
 function spotOpts(id) {
   // só mercado spot (evita carregar futuros e endpoints bloqueados por região)
-  const o = { defaultType: 'spot' };
-  if (id === 'binance') o.fetchMarkets = ['spot'];
-  if (id === 'bybit') o.fetchMarkets = ['spot'];
-  if (id === 'bitget') o.fetchMarkets = ['spot'];
+  // 1.9.5: TODAS as corretoras só spot (a OKX carregava futuros+opções = milhares de mercados)
+  const o = { defaultType: 'spot', fetchMarkets: { types: ['spot'] }, fetchMargins: false };
+  if (id === 'binance') o.fetchCurrencies = false; // a lista completa de moedas da Binance (dezenas de MB) só é lida em networksOf, uma vez
   return o;
 }
 function buildClient(id) {
   const store = readJSON(KEYS_FILE, {});
   const creds = store[id] ? dec(store[id]) : envCreds(id);
   const ex = new ccxt[id]({ enableRateLimit: true, timeout: 15000, options: spotOpts(id), ...creds });
+  // 1.9.5: qualquer chamada interna do ccxt (fetchBalance, fetchOrderBook...) passa pelo carregamento leve e em fila,
+  // em vez de descarregar todos os mercados e moedas da corretora em paralelo (era isto que passava os 512 MB)
+  ex.loadMarkets = async (reload = false) => { if (ex.markets && !reload) return ex.markets; if (reload) ex.markets = undefined; return ensureMarkets(ex); };
   clients[id] = ex;
   return ex;
 }
@@ -88,11 +90,15 @@ async function ensureMarkets(ex) {
   if (ex.markets) return ex.markets;
   const run = marketLock.then(async () => {
     if (ex.markets) return;
-    const all = await ex.loadMarkets();
-    const keep = KEEP_COINS(), mk = {}, cur = {};
-    for (const [sym, m] of Object.entries(all)) if (SYMBOLS.includes(sym) || (m.spot && keep.has(m.base) && m.quote === 'USDT')) mk[sym] = m;
-    for (const [c, v] of Object.entries(ex.currencies || {})) if (keep.has(c)) cur[c] = v;
-    ex.setMarkets(Object.values(mk), cur);
+    if (global.gc) global.gc();
+    // só a lista de mercados spot, sem a lista de moedas; na Binance sem os 'permissionSets' (a maior parte dos ~20 MB)
+    let list;
+    if (ex.id === 'binance') { try { list = await ex.fetchMarkets({ showPermissionSets: false, symbolStatus: 'TRADING' }); } catch (e) { list = await ex.fetchMarkets({ showPermissionSets: false }); } }
+    else list = await ex.fetchMarkets();
+    const keep = KEEP_COINS(), mk = [];
+    for (const m of list) if (m && (SYMBOLS.includes(m.symbol) || (m.spot && keep.has(m.base) && m.quote === 'USDT'))) mk.push(m);
+    list = null;
+    ex.setMarkets(mk);
     if (global.gc) global.gc();
   });
   marketLock = run.catch(() => {});
@@ -733,12 +739,25 @@ const TRANSFER_TIMEOUT_MIN = Number(process.env.TRANSFER_TIMEOUT_MIN ?? 30);
 const netCache = {}; // id -> { at, cur, error }
 const NET_ALIAS = { OPTIMISM: 'OP', 'AVAXC-CHAIN': 'AVAXC', AVAX_C: 'AVAXC', BSC: 'BEP20', TRX: 'TRC20', ETH: 'ERC20', POLYGON: 'MATIC', ARB: 'ARBITRUM', ARBONE: 'ARBITRUM', KAVAEVM: 'KAVAEVM' };
 const normNet = n => { const u = String(n || '').toUpperCase(); return NET_ALIAS[u] || u; };
-async function networksOf(id) {
+// 1.9.5: um pedido por corretora de cada vez (antes, cada par de rotas pedia a lista completa de moedas em paralelo:
+// dezenas de cópias de vários MB ao mesmo tempo = falta de memória no Render)
+const netInflight = {}; let netLock = Promise.resolve();
+function networksOf(id) {
+  const c = netCache[id];
+  if (c && Date.now() - c.at < (c.error ? 300000 : NET_TTL)) return Promise.resolve(c.cur);
+  if (!netInflight[id]) { const run = netLock.then(() => _networksOf(id)); netLock = run.catch(() => {}); netInflight[id] = run.finally(() => { delete netInflight[id]; }); }
+  return netInflight[id];
+}
+async function _networksOf(id) {
   const c = netCache[id];
   if (c && Date.now() - c.at < (c.error ? 300000 : NET_TTL)) return c.cur;
+  if (memNow() > MEM_SOFT_MB) { if (global.gc) global.gc(); if (memNow() > MEM_SOFT_MB) return c?.cur || {}; }
   const ex = client(id); let cur = {};
   try {
-    { const all = await ex.fetchCurrencies() || {}, keep = KEEP_COINS(); cur = {}; for (const c of Object.keys(all)) if (keep.has(c)) cur[c] = all[c]; }
+    { if (id === 'binance') ex.options.fetchCurrencies = true;
+      let all; try { all = await ex.fetchCurrencies() || {}; } finally { if (id === 'binance') ex.options.fetchCurrencies = false; }
+      const keep = KEEP_COINS(); cur = {}; for (const k of Object.keys(all)) if (keep.has(k)) { const v = all[k]; delete v.info; for (const n of Object.values(v.networks || {})) delete n.info; cur[k] = v; }
+      all = null; if (global.gc) global.gc(); }
     const codes = [...new Set(SYMBOLS.map(x => x.split('/')[0]))];
     const missing = codes.some(code => Object.values(cur[code]?.networks || {}).some(n => typeof n.fee !== 'number'));
     if (missing && ex.has.fetchDepositWithdrawFees && hasKeys(id)) {
@@ -1043,7 +1062,7 @@ setInterval(() => {
   memCleanup(); r = memNow();
   if (r > MEM_HARD_MB && !busy()) { memRecycle(); r = memNow(); console.warn(`[mem] clientes ccxt recriados, rss=${r}MB`); }
   if (r > MEM_EXIT_MB && !busy()) { console.warn(`[mem] rss=${r}MB acima de ${MEM_EXIT_MB}MB — reinício controlado`); setTimeout(() => process.exit(0), 200); }
-}, 20000).unref();
+}, 5000).unref();
 app.get('/api/memory', (req, res) => { memNow(); res.json({ ok: true, ...memState, softMb: MEM_SOFT_MB, hardMb: MEM_HARD_MB, exitMb: MEM_EXIT_MB }); });
 
 app.get('/', (req, res) => res.type('text').send('JET7 server ' + VERSION));
