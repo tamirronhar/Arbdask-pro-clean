@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.9.5';
+const VERSION = '1.9.6';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -649,7 +649,7 @@ app.get('/api/inventory', wrap(async (req, res) => {
 // 2) espera até MAKER_WAIT_SEC que alguém a execute, verificando sempre se a outra ponta ainda dá lucro (senão cancela);
 // 3) o que for executado é logo fechado na outra corretora a mercado (IOC com preço-limite sem prejuízo).
 // Em DRY_RUN não envia ordens: segue os negócios públicos e só conta como executada se houver negócios ao nosso preço.
-const MAKER_WAIT_SEC = Number(process.env.MAKER_WAIT_SEC ?? 60);
+const MAKER_WAIT_SEC = Number(process.env.MAKER_WAIT_SEC ?? 180);
 async function executeMaker(input) {
   const send = (code, body) => ({ code, body });
   const source = input.source || 'manual';
