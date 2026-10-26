@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.9.3';
+const VERSION = '1.9.4';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -333,6 +333,7 @@ const wrap = fn => (req, res) => fn(req, res).catch(e => res.status(500).json({ 
 
 app.get('/api/health', wrap(async (req, res) => {
   res.json({ ok: true, version: VERSION, dryRun: DRY_RUN, feeDiscount: FEE_DISCOUNT ? Object.fromEntries(Object.keys(FEE_TOKEN).map(id => [id, { token: FEE_TOKEN[id], balance: tokenBal[id]?.amount ?? null, active: discountOn(id), mult: FEE_MULT[id] }])) : false, stopped: STOPPED, symbols: SYMBOLS,
+    memory: { rssMb: memState.rssMb, peakMb: memState.peakMb, cleanups: memState.cleanups, recycles: memState.recycles },
     minProfitPct: MIN_PROFIT_PCT, maxOrderQuote: MAX_ORDER_QUOTE, autobot: { enabled: autobot.enabled, lastScanAt: autoState.lastScanAt, simulated: autoState.simulated, trades: autoState.trades }, historySync: { enabled: histSync.enabled, gist: !!gistId, lastOk: histSync.lastOk, lastError: histSync.lastError },
     exchanges: EXCHANGES.map(id => ({ id, keys: hasKeys(id) })) });
 }));
@@ -952,7 +953,8 @@ async function autobotTick() {
     const types = autobot.routeTypes && autobot.routeTypes.length ? autobot.routeTypes : ['simultanea'];
     // em sequência (não em paralelo) e transferências só a cada TRANSFER_SCAN_MIN minutos — o Render Free tem 512 MB
     const p0 = types.includes('simultanea') ? await scanOpps(autobot.amount, false) : { opportunities: [] };
-    const doT = types.includes('transferencia') && Date.now() - lastTransferScan > TRANSFER_SCAN_MIN * 60000 && ![...transferJobs.values()].some(j => j.status === 'running');
+    if (global.gc) global.gc();
+    const doT = types.includes('transferencia') && !memHigh() && Date.now() - lastTransferScan > TRANSFER_SCAN_MIN * 60000 && ![...transferJobs.values()].some(j => j.status === 'running');
     if (doT) lastTransferScan = Date.now();
     const p1 = doT ? await scanTransfers(autobot.amount, false) : { opportunities: [] };
     const parts = [p0, p1];
@@ -1008,6 +1010,41 @@ app.post('/api/autobot', wrap(async (req, res) => {
 app.post('/api/stop', wrap(async (req, res) => { setStopped(true); res.json({ ok: true, stopped: true }); }));
 app.post('/api/resume', wrap(async (req, res) => { setStopped(false); res.json({ ok: true, stopped: false }); }));
 app.get('/api/history', wrap(async (req, res) => res.json({ ok: true, trades: readJSON(HIST_FILE, []).slice(0, 200) })));
+
+
+// ---------- VIGILANTE DE MEMÓRIA (1.9.4) ----------
+// O Render Free mata a instância acima de 512 MB. A cada 20 s mede a memória:
+//  > MEM_SOFT_MB: limpa caches e força GC; o Autobot salta o scan de transferências.
+//  > MEM_HARD_MB: recria os clientes ccxt (liberta o que ficou preso dentro deles), fora de operações em curso.
+//  > MEM_EXIT_MB: reinício controlado (melhor que ser morto a meio de um scan).
+const MEM_SOFT_MB = Number(process.env.MEM_SOFT_MB ?? 330), MEM_HARD_MB = Number(process.env.MEM_HARD_MB ?? 400), MEM_EXIT_MB = Number(process.env.MEM_EXIT_MB ?? 470);
+const memState = { rssMb: 0, heapMb: 0, peakMb: 0, cleanups: 0, recycles: 0, lastCleanupAt: null, lastRecycleAt: null };
+const mb = n => Math.round(n / 1048576);
+function memNow() { const m = process.memoryUsage(); memState.rssMb = mb(m.rss); memState.heapMb = mb(m.heapUsed); memState.peakMb = Math.max(memState.peakMb, memState.rssMb); return memState.rssMb; }
+const memHigh = () => memNow() > MEM_SOFT_MB;
+function busy() { return autoState.running || [...transferJobs.values()].some(j => j.status === 'running'); }
+function memCleanup() {
+  bookCache.clear();
+  for (const [k, v] of routeCooldown) if (v < Date.now()) routeCooldown.delete(k);
+  for (const [k, j] of transferJobs) if (j.status !== 'running' && transferJobs.size > 20) transferJobs.delete(k);
+  if (global.gc) { global.gc(); global.gc(); }
+  memState.cleanups++; memState.lastCleanupAt = new Date().toISOString();
+}
+function memRecycle() {
+  for (const id of Object.keys(clients)) delete clients[id];
+  for (const id of Object.keys(marketFail)) delete marketFail[id];
+  memCleanup(); memState.recycles++; memState.lastRecycleAt = new Date().toISOString();
+}
+let memLastLog = 0;
+setInterval(() => {
+  let r = memNow();
+  if (Date.now() - memLastLog > 5 * 60000) { memLastLog = Date.now(); console.log(`[mem] rss=${r}MB heap=${memState.heapMb}MB pico=${memState.peakMb}MB limpezas=${memState.cleanups} reciclagens=${memState.recycles}`); }
+  if (r <= MEM_SOFT_MB) return;
+  memCleanup(); r = memNow();
+  if (r > MEM_HARD_MB && !busy()) { memRecycle(); r = memNow(); console.warn(`[mem] clientes ccxt recriados, rss=${r}MB`); }
+  if (r > MEM_EXIT_MB && !busy()) { console.warn(`[mem] rss=${r}MB acima de ${MEM_EXIT_MB}MB — reinício controlado`); setTimeout(() => process.exit(0), 200); }
+}, 20000).unref();
+app.get('/api/memory', (req, res) => { memNow(); res.json({ ok: true, ...memState, softMb: MEM_SOFT_MB, hardMb: MEM_HARD_MB, exitMb: MEM_EXIT_MB }); });
 
 app.get('/', (req, res) => res.type('text').send('JET7 server ' + VERSION));
 app.listen(PORT, () => console.log(`JET7 server ${VERSION} na porta ${PORT} — DRY_RUN=${DRY_RUN}`));
