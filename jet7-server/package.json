@@ -4,7 +4,7 @@
   "description": "",
   "main": "server.js",
   "scripts": {
-    "start": "MALLOC_ARENA_MAX=2 node --max-old-space-size=220 --max-semi-space-size=4 --expose-gc server.js",
+    "start": "MALLOC_ARENA_MAX=2 node --max-old-space-size=300 --max-semi-space-size=4 --expose-gc server.js",
     "gerar-chaves": "node gerar-chaves.js"
   },
   "keywords": [],
