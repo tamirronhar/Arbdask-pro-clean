@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.9.6';
+const VERSION = '1.9.7';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -1065,6 +1065,159 @@ setInterval(() => {
 }, 5000).unref();
 app.get('/api/memory', (req, res) => { memNow(); res.json({ ok: true, ...memState, softMb: MEM_SOFT_MB, hardMb: MEM_HARD_MB, exitMb: MEM_EXIT_MB }); });
 
+
+// ---------- 1.9.7: pagamentos de planos em USDT (endereço de depósito da Binance) ----------
+// Cada pedido recebe um valor único (ex.: 19,0347 USDT). O servidor lê o histórico de depósitos da Binance
+// (só leitura, pela chave já ligada) e, quando chega um depósito com esse valor exato, ativa o plano e emite a licença.
+// Pedidos e licenças ficam no Gist privado (jet7-payments.json): sobrevivem a reinícios e deploys.
+const PAY_EXCHANGE = 'binance';
+const PAY_COIN = 'USDT';
+const PAY_NETWORK = (process.env.PAY_NETWORK || 'TRX').toUpperCase();          // TRX = TRC20
+const PAY_NET_LABEL = { TRX: 'TRC20 (Tron)', BSC: 'BEP20 (BNB Smart Chain)', ETH: 'ERC20 (Ethereum)' }[PAY_NETWORK] || PAY_NETWORK;
+const PAY_ORDER_MIN = Number(process.env.PAY_ORDER_MIN ?? 60);                   // minutos para pagar
+const PAY_LATE_HOURS = 24;                                                       // ainda aceita depósito atrasado até 24 h
+const PLANS = {
+  teste:    { name: 'Teste',     price: 0,   days: 7 },
+  manual:   { name: 'Manual',    price: Number(process.env.PRICE_MANUAL ?? 19),  days: 30 },
+  pro:      { name: 'Pro',       price: Number(process.env.PRICE_PRO ?? 49),     days: 30 },
+  proanual: { name: 'Pro Anual', price: Number(process.env.PRICE_PROANUAL ?? 399), days: 365 },
+};
+const GIST_PAY = 'jet7-payments.json';
+let pay = { orders: [], licenses: [] }, payAddr = null, payState = { lastCheck: null, lastError: null, addressError: null }, paySaveTimer = null;
+const r4 = x => Math.round(x * 10000) / 10000;
+const nowIso = () => new Date().toISOString();
+function savePay() {
+  clearTimeout(paySaveTimer);
+  paySaveTimer = setTimeout(async () => {
+    if (!GH_TOKEN) return;
+    try { await gh('/gists/' + await findOrCreateGist(), { method: 'PATCH', body: JSON.stringify({ files: { [GIST_PAY]: { content: JSON.stringify(pay) } } }) }); }
+    catch (e) { console.warn('Gist pagamentos: ' + e.message); }
+  }, 2000);
+}
+async function loadPay() {
+  if (!GH_TOKEN) return;
+  try {
+    const g = await gh('/gists/' + await findOrCreateGist());
+    const f = g.files && g.files[GIST_PAY];
+    if (f && f.content) { const d = JSON.parse(f.content); pay = { orders: d.orders || [], licenses: d.licenses || [] }; console.log(`Pagamentos carregados: ${pay.orders.length} pedidos, ${pay.licenses.length} licenças`); }
+  } catch (e) { console.warn('Gist pagamentos: ' + e.message); }
+}
+setTimeout(loadPay, 4000);
+async function getPayAddress() {
+  if (payAddr) return payAddr;
+  if (process.env.PAY_ADDRESS) return (payAddr = { address: process.env.PAY_ADDRESS.trim(), tag: process.env.PAY_TAG || '' });
+  if (!hasKeys(PAY_EXCHANGE)) throw new Error('Chave da Binance não ligada');
+  try {
+    const r = await client(PAY_EXCHANGE).sapiGetCapitalDepositAddress({ coin: PAY_COIN, network: PAY_NETWORK });
+    if (!r || !r.address) throw new Error('A Binance não devolveu endereço');
+    payAddr = { address: r.address, tag: r.tag || '' }; payState.addressError = null; return payAddr;
+  } catch (e) { payState.addressError = e.message; throw e; }
+}
+function licKey() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', b = crypto.randomBytes(12);
+  let s = ''; for (let i = 0; i < 12; i++) s += A[b[i] % A.length];
+  return `J7-${s.slice(0, 4)}-${s.slice(4, 8)}-${s.slice(8)}`;
+}
+function issueLicense(order, info = {}) {
+  // renova: se o mesmo email já tem licença ativa do mesmo plano, prolonga a partir do fim
+  const now = Date.now();
+  const active = pay.licenses.filter(l => l.email === order.email && new Date(l.expiresAt).getTime() > now && l.plan === order.plan).sort((a, b) => b.expiresAt.localeCompare(a.expiresAt))[0];
+  const start = active ? new Date(active.expiresAt).getTime() : now;
+  const lic = { key: licKey(), plan: order.plan, planName: PLANS[order.plan].name, email: order.email, orderId: order.id, issuedAt: nowIso(), expiresAt: new Date(start + PLANS[order.plan].days * 86400000).toISOString(), ...info };
+  pay.licenses.unshift(lic); order.license = lic.key; return lic;
+}
+const pubOrder = o => ({ id: o.id, plan: o.plan, planName: PLANS[o.plan]?.name, email: o.email, amount: o.amount, coin: PAY_COIN, network: PAY_NETWORK, networkLabel: PAY_NET_LABEL, address: o.address, tag: o.tag || '', status: o.status, createdAt: o.createdAt, expiresAt: o.expiresAt, paidAt: o.paidAt || null, txId: o.txId || null, license: o.status === 'paid' ? (pay.licenses.find(l => l.key === o.license) || null) : null });
+function expireOrders() {
+  const now = Date.now(); let ch = false;
+  for (const o of pay.orders) if (o.status === 'pending' && now - new Date(o.createdAt).getTime() > PAY_LATE_HOURS * 3600000) { o.status = 'expired'; ch = true; }
+  if (ch) savePay();
+}
+let payChecking = false;
+async function checkPayments() {
+  expireOrders();
+  const pend = pay.orders.filter(o => o.status === 'pending');
+  if (!pend.length || payChecking || !hasKeys(PAY_EXCHANGE)) return;
+  payChecking = true;
+  try {
+    const since = Math.min(...pend.map(o => new Date(o.createdAt).getTime())) - 5 * 60000;
+    const deps = await client(PAY_EXCHANGE).sapiGetCapitalDepositHisrec({ coin: PAY_COIN, startTime: since, limit: 1000 });
+    const used = new Set(pay.orders.filter(o => o.txId).map(o => o.txId));
+    for (const d of deps || []) {
+      if (String(d.status) !== '1' && String(d.status) !== '6') continue;      // 1 = creditado, 6 = creditado mas sem levantamento ainda
+      if (String(d.network || '').toUpperCase() !== PAY_NETWORK) continue;
+      if (used.has(d.txId)) continue;
+      const amt = r4(Number(d.amount)), t = Number(d.insertTime);
+      const o = pend.find(x => x.status === 'pending' && x.amount === amt && t >= new Date(x.createdAt).getTime() - 2 * 60000);
+      if (!o) continue;
+      o.status = 'paid'; o.paidAt = new Date(t).toISOString(); o.txId = d.txId; used.add(d.txId);
+      const lic = issueLicense(o);
+      console.log(`PAGAMENTO recebido: ${o.amount} USDT, plano ${o.plan}, licença ${lic.key}`);
+    }
+    payState.lastCheck = nowIso(); payState.lastError = null; savePay();
+  } catch (e) { payState.lastError = e.message; console.warn('Pagamentos: ' + e.message); }
+  finally { payChecking = false; }
+}
+setInterval(checkPayments, 45000);
+
+const okEmail = e => /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/.test(e);
+app.get('/public/plans', (req, res) => res.json({ ok: true, coin: PAY_COIN, network: PAY_NETWORK, networkLabel: PAY_NET_LABEL, plans: Object.entries(PLANS).map(([id, p]) => ({ id, ...p })) }));
+app.post('/public/pay/create', async (req, res) => {
+  try {
+    const plan = String(req.body?.plan || '').toLowerCase(), email = String(req.body?.email || '').trim().toLowerCase();
+    if (!PLANS[plan]) return res.status(400).json({ ok: false, error: 'Plano inválido' });
+    if (!okEmail(email)) return res.status(400).json({ ok: false, error: 'Email inválido' });
+    if (plan === 'teste') {
+      if (pay.licenses.some(l => l.email === email && l.plan === 'teste')) return res.status(400).json({ ok: false, error: 'Este email já usou o teste grátis' });
+      const o = { id: crypto.randomBytes(8).toString('hex'), plan, email, amount: 0, status: 'paid', createdAt: nowIso(), expiresAt: nowIso(), paidAt: nowIso() };
+      pay.orders.unshift(o); issueLicense(o, { trial: true }); savePay();
+      return res.json({ ok: true, order: pubOrder(o) });
+    }
+    expireOrders();
+    const pend = pay.orders.filter(o => o.status === 'pending');
+    const mine = pend.find(o => o.email === email && o.plan === plan && Date.now() < new Date(o.expiresAt).getTime());
+    if (mine) return res.json({ ok: true, order: pubOrder(mine) });
+    if (pend.length >= 200) return res.status(429).json({ ok: false, error: 'Demasiados pedidos em aberto. Tente mais tarde.' });
+    const a = await getPayAddress();
+    const taken = new Set(pend.map(o => o.amount));
+    let amount = 0;
+    for (let i = 0; i < 500 && (!amount || taken.has(amount)); i++) amount = r4(PLANS[plan].price + (1 + crypto.randomInt(998)) / 10000);
+    const o = { id: crypto.randomBytes(8).toString('hex'), plan, email, amount, address: a.address, tag: a.tag, status: 'pending', createdAt: nowIso(), expiresAt: new Date(Date.now() + PAY_ORDER_MIN * 60000).toISOString() };
+    pay.orders.unshift(o); pay.orders = pay.orders.slice(0, 2000); savePay();
+    res.json({ ok: true, order: pubOrder(o) });
+  } catch (e) { res.status(500).json({ ok: false, error: 'Pagamentos indisponíveis: ' + e.message }); }
+});
+let lastPokeAt = 0;
+app.get('/public/pay/:id', async (req, res) => {
+  const o = pay.orders.find(x => x.id === req.params.id);
+  if (!o) return res.status(404).json({ ok: false, error: 'Pedido não encontrado' });
+  if (o.status === 'pending' && Date.now() - lastPokeAt > 15000) { lastPokeAt = Date.now(); await checkPayments(); }
+  res.json({ ok: true, order: pubOrder(o) });
+});
+app.get('/public/license/:key', (req, res) => {
+  const l = pay.licenses.find(x => x.key === String(req.params.key).trim().toUpperCase());
+  if (!l) return res.status(404).json({ ok: false, valid: false, error: 'Licença não encontrada' });
+  const valid = !l.revoked && new Date(l.expiresAt).getTime() > Date.now();
+  res.json({ ok: true, valid, key: l.key, plan: l.plan, planName: l.planName, expiresAt: l.expiresAt, revoked: !!l.revoked });
+});
+app.get('/api/payments', wrap(async (req, res) => {
+  let address = payAddr?.address || null;
+  if (!address) { try { address = (await getPayAddress()).address; } catch (e) {} }
+  const paid = pay.orders.filter(o => o.status === 'paid' && o.amount > 0);
+  res.json({ ok: true, address, network: PAY_NETWORK, ...payState, totals: { paidOrders: paid.length, usdt: r4(paid.reduce((s, o) => s + o.amount, 0)), activeLicenses: pay.licenses.filter(l => !l.revoked && new Date(l.expiresAt) > new Date()).length }, orders: pay.orders.slice(0, 100).map(pubOrder), licenses: pay.licenses.slice(0, 200) });
+}));
+// confirmação manual pelo admin (ex.: cliente enviou valor ligeiramente diferente)
+app.post('/api/payments/:id/confirm', wrap(async (req, res) => {
+  const o = pay.orders.find(x => x.id === req.params.id);
+  if (!o) return res.status(404).json({ ok: false, error: 'Pedido não encontrado' });
+  if (o.status === 'paid') return res.json({ ok: true, order: pubOrder(o) });
+  o.status = 'paid'; o.paidAt = nowIso(); o.txId = req.body?.txId || 'manual'; issueLicense(o, { manual: true }); savePay();
+  res.json({ ok: true, order: pubOrder(o) });
+}));
+app.post('/api/licenses/:key/revoke', wrap(async (req, res) => {
+  const l = pay.licenses.find(x => x.key === req.params.key);
+  if (!l) return res.status(404).json({ ok: false, error: 'Licença não encontrada' });
+  l.revoked = true; savePay(); res.json({ ok: true });
+}));
 app.get('/', (req, res) => res.type('text').send('JET7 server ' + VERSION));
 app.listen(PORT, () => console.log(`JET7 server ${VERSION} na porta ${PORT} — DRY_RUN=${DRY_RUN}`));
 // manter acordado no Render Free (adormece após 15 min sem visitas): ping ao próprio endereço público a cada 10 min
