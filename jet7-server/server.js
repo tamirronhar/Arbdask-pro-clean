@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.14.0';
+const VERSION = '1.15.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -1103,13 +1103,17 @@ function learningSummary() {
     .sort((a, b) => b.fills - a.fills || b.tries - a.tries).slice(0, 15);
 }
 // ---------- 1.14.0: simulação realista do Autobot do dono ----------
-// 1) só corretoras com chaves (a Bybit sem chaves não conta); 2) a mesma rota só repete passados SIM_REPEAT_MIN minutos
-// (a liquidez apanhada não volta logo); 3) inventário virtual: compra gasta USDT na corretora de compra e venda gasta a moeda
+// 1) só corretoras com chaves (a Bybit sem chaves não conta); 2) a mesma rota repete quando há liquidez nova
+// (1.15.0: repete quando o livro mostra liquidez nova); 3) inventário virtual: compra gasta USDT na corretora de compra e venda gasta a moeda
 // na de venda; quando um lado acaba, simula o reequilíbrio com custo SIM_REBAL_FEE USDT por transferência.
-const SIM_REPEAT_MIN = Number(process.env.SIM_REPEAT_MIN ?? 10), SIM_INV_OPS = Number(process.env.SIM_INV_OPS ?? 4), SIM_REBAL_FEE = Number(process.env.SIM_REBAL_FEE ?? 0.5);
+const SIM_REFILL_SEC = Number(process.env.SIM_REFILL_SEC ?? 45), SIM_INV_OPS = Number(process.env.SIM_INV_OPS ?? 4), SIM_REBAL_FEE = Number(process.env.SIM_REBAL_FEE ?? 0.5);
 const SIM_INV_FILE = path.join(DATA_DIR, 'sim-inventory.json');
 let simInv = readJSON(SIM_INV_FILE, {});
-const simRepeat = new Map();
+const simRepeat = new Map(); // id -> { sig, at }: assinatura do livro na última simulação
+// 1.15.0: sem pausa fixa — repete a rota logo que o livro mostrar liquidez nova (preço/quantidade mudou)
+// ou, com o mesmo livro, depois de SIM_REFILL_SEC (tempo típico de reposição pelos market makers)
+const bookSig = o => [o.buyPrice, o.sellPrice, o.buyLimit, o.sellLimit, o.preview?.maxAmount].map(x => Number(x || 0).toFixed(6)).join('|');
+const simBlocked = (o, now) => { const r = simRepeat.get(o.id); return !!r && r.sig === bookSig(o) && now - r.at < SIM_REFILL_SEC * 1000; };
 function simBal(ex, coin) { simInv[ex] = simInv[ex] || {}; if (simInv[ex][coin] == null) simInv[ex][coin] = SIM_INV_OPS * (autobot.amount || DEFAULT_AMOUNT); return simInv[ex][coin]; }
 // devolve null se cabe; se não cabe, simula o reequilíbrio (custo) e devolve o registo
 function simReserve(o, amt) {
@@ -1152,15 +1156,15 @@ async function autobotTick() {
       (!autobot.symbols.length || autobot.symbols.includes(o.symbol)) &&
       (!autobot.exchanges.length || (autobot.exchanges.includes(o.buyExchange) && autobot.exchanges.includes(o.sellExchange))) &&
       hasKeys(o.buyExchange) && hasKeys(o.sellExchange) &&
-      !((routeCooldown.get(o.id) || 0) > now) && !((simRepeat.get(o.id) || 0) > now));
+      !((routeCooldown.get(o.id) || 0) > now) && !simBlocked(o, now));
     autoState.lastBestTriangle = p2.opportunities[0] ? { id: p2.opportunities[0].id, netPct: p2.opportunities[0].netPct, netProfit: p2.opportunities[0].netProfit } : null;
     autoState.lastBest = data.opportunities[0] ? { id: data.opportunities[0].id, netPct: data.opportunities[0].netPct, netProfit: data.opportunities[0].netProfit, maxNetProfit: data.opportunities[0].preview.maxNetProfit } : null;
     // triangulares (mesma corretora): executa a melhor se passar o mínimo e for melhor do que a melhor rota entre corretoras
-    const tri = p2.opportunities.find(o => o.meetsMin && o.netProfit >= autobot.minProfitUsdt && !((routeCooldown.get(o.id) || 0) > now) && !((simRepeat.get(o.id) || 0) > now) && hasKeys(o.exchange) && (!autobot.exchanges.length || autobot.exchanges.includes(o.exchange)));
+    const tri = p2.opportunities.find(o => o.meetsMin && o.netProfit >= autobot.minProfitUsdt && !((routeCooldown.get(o.id) || 0) > now) && !simBlocked(o, now) && hasKeys(o.exchange) && (!autobot.exchanges.length || autobot.exchanges.includes(o.exchange)));
     if (tri && (!cands.length || tri.netProfit >= Math.max(cands[0].netProfit, cands[0].preview.maxNetProfit))) {
       const r = await executeTriangle({ exchange: tri.exchange, path: tri.path, amount: autobot.amount, source: 'autobot' }); const b = r.body || {};
       routeCooldown.set(tri.id, Date.now() + autobot.cooldownSec * 1000);
-      if (DRY_RUN) simRepeat.set(tri.id, Date.now() + SIM_REPEAT_MIN * 60000);
+      if (DRY_RUN) simRepeat.set(tri.id, { sig: bookSig(tri), at: Date.now() });
       autoState.lastAction = { at: new Date().toISOString(), route: tri.id, status: b.status, netProfit: b.netProfit ?? 0, message: b.message || b.error };
       if (b.status === 'dry_run') { autoState.simulated++; autoState.profitUsdt += b.netProfit || 0; }
       if (b.status === 'executed') { autoState.trades++; autoState.profitUsdt += b.netProfit || 0; }
@@ -1195,7 +1199,7 @@ async function autobotTick() {
       if (b.status === 'dry_run') {
         autoState.simulated++; autoState.profitUsdt += b.netProfit || 0;
         if (!useMk && o.type !== 'transfer') {
-          simRepeat.set(o.id, Date.now() + SIM_REPEAT_MIN * 60000);
+          simRepeat.set(o.id, { sig: bookSig(o), at: Date.now() });
           if (rebal && rebal.fee > 0) { record({ source: 'autobot', type: 'rebalance', status: 'dry_run', symbol: o.symbol, buyExchange: o.buyExchange, sellExchange: o.sellExchange, netProfit: -rebal.fee, moves: rebal.need, message: `Reequilíbrio simulado (${rebal.need.map(n => n.coin + '→' + n.to).join(', ')}) — custo ${rebal.fee} USDT` }); autoState.profitUsdt -= rebal.fee; }
           simApply({ ...o, amount: o.amount || args.amount }, b.amount || args.amount, b.netProfit);
         }
@@ -1212,7 +1216,7 @@ function scheduleAutobot() {
 }
 function autobotStatus() {
   return { ok: true, dryRun: DRY_RUN, stopped: STOPPED, config: autobot, state: autoState, last24h: stats24h(), learning: learningSummary(),
-    simulation: { repeatMin: SIM_REPEAT_MIN, inventoryOps: SIM_INV_OPS, rebalanceFeeUsdt: SIM_REBAL_FEE, inventory: simInv },
+    simulation: { repeatRule: 'repete quando o livro tem liquidez nova', refillSec: SIM_REFILL_SEC, inventoryOps: SIM_INV_OPS, rebalanceFeeUsdt: SIM_REBAL_FEE, inventory: simInv },
     message: autobot.enabled ? (DRY_RUN ? 'Autobot ligado em SIMULAÇÃO (DRY_RUN): nenhuma ordem real é enviada' : 'Autobot ligado em MODO REAL') : 'Autobot desligado' };
 }
 app.get('/api/autobot', wrap(async (req, res) => res.json(autobotStatus())));
