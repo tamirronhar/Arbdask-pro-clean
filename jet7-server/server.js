@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.15.1';
+const VERSION = '1.16.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -22,6 +22,7 @@ const DEFAULT_AMOUNT = Number(process.env.DEFAULT_AMOUNT ?? 50);     // quantida
 const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS ?? 3);
 const SYMBOLS = (process.env.SYMBOLS || 'USDC/USDT,FDUSD/USDT,USDE/USDT,TUSD/USDT,PYUSD/USDT,USD1/USDT,DAI/USDT,USDD/USDT,RLUSD/USDT,USDP/USDT,USDS/USDT,FDUSD/USDC,USDE/USDC,USD1/USDC,PYUSD/USDC').split(',').map(s => s.trim()).filter(Boolean);
 const EXCHANGES = (process.env.EXCHANGES || 'binance,bybit,okx,kucoin,bitget,mexc,gate').split(',').map(s => s.trim()).filter(Boolean);
+const FIAT_SYMBOLS = (process.env.FIAT_SYMBOLS || 'USDT/BRL,USDT/EUR,USDT/TRY').split(',').map(s => s.trim()).filter(Boolean);
 const COINS = [...new Set(SYMBOLS.flatMap(s => s.split('/')))];
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim());
 
@@ -96,7 +97,7 @@ async function ensureMarkets(ex) {
     if (ex.id === 'binance') { try { list = await ex.fetchMarkets({ showPermissionSets: false, symbolStatus: 'TRADING' }); } catch (e) { list = await ex.fetchMarkets({ showPermissionSets: false }); } }
     else list = await ex.fetchMarkets();
     const keep = KEEP_COINS(), mk = [];
-    for (const m of list) if (m && (SYMBOLS.includes(m.symbol) || (m.spot && keep.has(m.base) && m.quote === 'USDT'))) mk.push(m);
+    for (const m of list) if (m && (SYMBOLS.includes(m.symbol) || FIAT_SYMBOLS.includes(m.symbol) || (m.spot && keep.has(m.base) && m.quote === 'USDT'))) mk.push(m);
     list = null;
     ex.setMarkets(mk);
     if (global.gc) global.gc();
@@ -1094,10 +1095,11 @@ function routeLearning() {
   return map;
 }
 function stats24h() {
-  const since = new Date(Date.now() - 86400000).toISOString(), st = { since, maker: { tries: 0, fills: 0, profit: 0 }, taker: { sims: 0, executed: 0, profit: 0 }, triangular: { sims: 0, profit: 0 }, transfer: { started: 0 }, held: 0, rebalance: { count: 0, cost: 0 }, ignoredNoKeys: 0 };
+  const since = new Date(Date.now() - 86400000).toISOString(), st = { since, maker: { tries: 0, fills: 0, profit: 0 }, taker: { sims: 0, executed: 0, profit: 0 }, triangular: { sims: 0, profit: 0 }, transfer: { started: 0 }, held: 0, rebalance: { count: 0, cost: 0 }, ignoredNoKeys: 0, fiat: { sims: 0, profit: 0, byPair: {} } };
   for (const t of readJSON(HIST_FILE, [])) {
     if (t.at < since || t.source === 'client') continue;
     if (t.status === 'held') { st.held++; continue; }
+    if (t.type === 'fiat_sim') { st.fiat.sims++; st.fiat.profit += t.netProfit || 0; st.fiat.byPair[t.symbol] = (st.fiat.byPair[t.symbol] || 0) + 1; continue; }
     if (t.type === 'rebalance') { st.rebalance.count++; st.rebalance.cost += -(t.netProfit || 0); continue; }
     if ((t.buyExchange && !hasKeys(t.buyExchange)) || (t.sellExchange && !hasKeys(t.sellExchange))) { st.ignoredNoKeys++; continue; }
     if (t.type === 'maker') { st.maker.tries++; if ((t.filled || 0) > 0) { st.maker.fills++; st.maker.profit += t.netProfit || 0; } }
@@ -1107,6 +1109,7 @@ function stats24h() {
     else if (t.status === 'executed') { st.taker.executed++; st.taker.profit += t.netProfit || 0; }
   }
   for (const k of ['maker', 'taker', 'triangular']) st[k].profit = Math.round(st[k].profit * 10000) / 10000;
+  st.fiat.profit = Math.round(st.fiat.profit * 10000) / 10000;
   st.rebalance.cost = Math.round(st.rebalance.cost * 10000) / 10000;
   st.totalProfit = Math.round((st.maker.profit + st.taker.profit + st.triangular.profit - st.rebalance.cost) * 10000) / 10000;
   return st;
@@ -1689,6 +1692,73 @@ setInterval(clientAutobotTick, 60000);
 app.get('/api/users', (req, res) => res.json({ ok: true, users: users.map(u => ({ ...pubUser(u), lastLoginAt: u.lastLoginAt, disabled: !!u.disabled, stopped: !!u.stopped, opsToday: opsToday(u), lastAction: stOf(u).lastAction, profitSimUsdt: (u.hist || []).filter(t => t.status === 'dry_run').reduce((x, t) => x + (t.netProfit || 0), 0) })) }));
 app.post('/api/users/:id/disable', (req, res) => { const u = users.find(x => x.id === req.params.id); if (!u) return res.status(404).json({ ok: false, error: 'Não encontrado' }); u.disabled = req.body?.disabled !== false; if (u.disabled) { u.autobot.enabled = false; u.tv = (u.tv || 0) + 1; } saveUsers(); res.json({ ok: true, disabled: u.disabled }); });
 app.get('/', (req, res) => res.type('text').send('JET7 server ' + VERSION));
+
+// ---------- 1.16.0: ARBITRAGEM USDT/FIAT NO LIVRO SPOT (SÓ SIMULAÇÃO, SEM P2P) ----------
+// Como o Arb Desk (USDT/BRL): compra USDT com fiat na corretora A (ask), vende USDT por fiat na B (bid), pelo livro spot.
+// Inventário pré-posicionado: USDT na B e fiat na A. Custo de reequilíbrio = taxa real de levantamento de USDT (rede mais
+// barata A→B) dividida pelas SIM_INV_OPS operações do ciclo + FIAT_BANK_FEE_PCT para o fiat voltar (PIX/SEPA; 0 por omissão).
+// Nunca envia ordens: só regista simulações (type fiat_sim). P2P não é usado.
+const FIAT_ENABLED = String(process.env.FIAT_ENABLED ?? 'true').toLowerCase() !== 'false';
+const FIAT_BANK_FEE_PCT = Number(process.env.FIAT_BANK_FEE_PCT ?? 0);
+const FIAT_SCAN_SEC = Number(process.env.FIAT_SCAN_SEC ?? 60);
+let fiatCache = { at: 0, list: [], support: {} };
+const fiatRepeat = new Map();
+async function quoteFiat(a, b, symbol, usdt) {
+  const xa = client(a), xb = client(b);
+  const [ba, bb] = await Promise.all([bookOf(a, symbol), bookOf(b, symbol)]);
+  const buy = walk(ba.asks, usdt), sell = walk(bb.bids, usdt);
+  if (!buy || !sell) return null;
+  const fa = takerFee(xa, symbol), fb = takerFee(xb, symbol);
+  const cost = usdt * buy.avg * (1 + fa), revenue = usdt * sell.avg * (1 - fb);
+  const mid = (buy.avg + sell.avg) / 2;
+  let wfee = 1, net = null;
+  try { const [ca, cb] = await Promise.all([networksOf(a), networksOf(b)]); const n = commonNets(ca, cb, 'USDT')[0]; if (n) { wfee = n.fee; net = n.network; } } catch (e) {}
+  const rebalUsdt = wfee / Math.max(SIM_INV_OPS, 1) + usdt * FIAT_BANK_FEE_PCT / 100;
+  const netFiat = revenue - cost, netUsdt = netFiat / mid - rebalUsdt;
+  const grossPct = (sell.avg / buy.avg - 1) * 100, netPct = netUsdt / usdt * 100;
+  return { type: 'fiat', id: `FIAT:${symbol}:${a}>${b}`, symbol, fiat: symbol.split('/')[1], buyExchange: a, sellExchange: b, amount: usdt,
+    buyPrice: buy.avg, sellPrice: sell.avg, grossPct, fees: { buy: fa, sell: fb }, usdtNetwork: net, usdtWithdrawFee: wfee, rebalanceUsdtPerOp: rebalUsdt,
+    netFiat, netProfit: netUsdt, netPct, meetsMin: netPct >= MIN_PROFIT_PCT, sig: [buy.avg, sell.avg].map(x => x.toFixed(6)).join('|') };
+}
+async function scanFiat(usdt) {
+  const list = [], support = {};
+  for (const symbol of FIAT_SYMBOLS) {
+    const ids = []; for (const id of EXCHANGES) if (await supports(id, symbol)) ids.push(id);
+    support[symbol] = ids;
+    const pairs = []; for (const a of ids) for (const b of ids) if (a !== b) pairs.push([a, b]);
+    const qs = await Promise.all(pairs.map(([a, b]) => quoteFiat(a, b, symbol, usdt).catch(() => null)));
+    for (const q of qs) if (q) list.push(q);
+    if (global.gc) global.gc();
+  }
+  list.sort((x, y) => y.netProfit - x.netProfit);
+  fiatCache = { at: Date.now(), list, support };
+  return fiatCache;
+}
+async function fiatTick() {
+  if (!FIAT_ENABLED || STOPPED || memHigh()) return;
+  try {
+    const amt = autobot.amount || DEFAULT_AMOUNT;
+    const { list } = await scanFiat(amt), now = Date.now();
+    // simula a melhor rota por par que tenha lucro líquido acima do mínimo (repete só com livro novo ou após SIM_REFILL_SEC)
+    const done = new Set();
+    for (const o of list) {
+      if (done.has(o.symbol) || !o.meetsMin || o.netProfit <= 0) continue;
+      const r = fiatRepeat.get(o.id); if (r && r.sig === o.sig && now - r.at < SIM_REFILL_SEC * 1000) continue;
+      done.add(o.symbol); fiatRepeat.set(o.id, { sig: o.sig, at: now });
+      record({ source: 'fiat-sim', type: 'fiat_sim', status: 'dry_run', symbol: o.symbol, buyExchange: o.buyExchange, sellExchange: o.sellExchange, amount: o.amount,
+        netProfit: +o.netProfit.toFixed(4), netPct: +o.netPct.toFixed(4), grossPct: +o.grossPct.toFixed(4), rebalanceUsdtPerOp: +o.rebalanceUsdtPerOp.toFixed(4),
+        message: `Simulação ${o.symbol}: compra USDT na ${o.buyExchange}, vende na ${o.sellExchange} — spread ${o.grossPct.toFixed(3)}%, líquido ${o.netPct.toFixed(3)}% (${o.netProfit.toFixed(2)} USDT)` });
+    }
+  } catch (e) { console.warn('[fiat] ' + e.message.slice(0, 120)); }
+}
+if (FIAT_ENABLED) setInterval(fiatTick, FIAT_SCAN_SEC * 1000);
+app.get('/api/fiat-opportunities', wrap(async (req, res) => {
+  const amt = Number(req.query.amount) || autobot.amount || DEFAULT_AMOUNT;
+  const c = Date.now() - fiatCache.at < 30000 ? fiatCache : await scanFiat(amt);
+  res.json({ ok: true, simulation: true, p2p: false, minProfitPct: MIN_PROFIT_PCT, bankFeePct: FIAT_BANK_FEE_PCT, inventoryOps: SIM_INV_OPS, support: c.support,
+    opportunities: c.list.slice(0, Number(req.query.limit) || 15).map(({ sig, ...o }) => o) });
+}));
+
 app.listen(PORT, () => console.log(`JET7 server ${VERSION} na porta ${PORT} — DRY_RUN=${DRY_RUN}`));
 // manter acordado no Render Free (adormece após 15 min sem visitas): ping ao próprio endereço público a cada 10 min
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
