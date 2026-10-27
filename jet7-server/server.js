@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.11.0';
+const VERSION = '1.12.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -1058,6 +1058,31 @@ async function loadAutobotFromGist() {
   } catch (e) { console.warn('Gist autobot: ' + e.message); }
 }
 
+
+// ---------- 1.12.0: o Autobot aprende com o histórico ----------
+// Para cada rota maker (moeda + compra → venda) conta tentativas e preenchimentos das últimas LEARN_HOURS horas.
+// Rotas que falham sempre ficam em pausa; as que já preencheram ganham prioridade (lucro esperado = lucro × taxa de preenchimento).
+const LEARN_HOURS = Number(process.env.LEARN_HOURS ?? 48), DEAD_MIN_TRIES = Number(process.env.DEAD_MIN_TRIES ?? 15), DEAD_PAUSE_H = Number(process.env.DEAD_PAUSE_H ?? 6);
+const routeKey = (sym, b, s) => `${sym}|${b}|${s}`;
+let learnCache = { at: 0, map: new Map() };
+function routeLearning() {
+  if (Date.now() - learnCache.at < 60000) return learnCache.map;
+  const since = new Date(Date.now() - LEARN_HOURS * 3600000).toISOString(), map = new Map();
+  for (const t of readJSON(HIST_FILE, [])) {
+    if (t.at < since || t.type !== 'maker' || t.status === 'held') continue;
+    const k = routeKey(t.symbol, t.buyExchange, t.sellExchange), r = map.get(k) || { tries: 0, fills: 0, profit: 0, lastFill: null, lastTry: null };
+    r.tries++; if ((t.filled || 0) > 0) { r.fills++; r.profit += t.netProfit || 0; if (!r.lastFill || t.at > r.lastFill) r.lastFill = t.at; }
+    if (!r.lastTry || t.at > r.lastTry) r.lastTry = t.at;
+    map.set(k, r);
+  }
+  for (const r of map.values()) { r.fillRate = (r.fills + 1) / (r.tries + 2); r.dead = r.tries >= DEAD_MIN_TRIES && r.fills === 0; r.pausedUntil = r.dead ? new Date(Date.parse(r.lastTry) + DEAD_PAUSE_H * 3600000).toISOString() : null; if (r.dead && Date.now() > Date.parse(r.pausedUntil)) r.dead = false; }
+  learnCache = { at: Date.now(), map };
+  return map;
+}
+function learningSummary() {
+  return [...routeLearning().entries()].map(([k, r]) => ({ route: k.replace(/\|/g, ' '), tries: r.tries, fills: r.fills, fillRatePct: Math.round(r.fillRate * 1000) / 10, profit: Math.round(r.profit * 10000) / 10000, paused: r.dead, pausedUntil: r.dead ? r.pausedUntil : null }))
+    .sort((a, b) => b.fills - a.fills || b.tries - a.tries).slice(0, 15);
+}
 const TRANSFER_SCAN_MIN = Number(process.env.TRANSFER_SCAN_MIN ?? 15); let lastTransferScan = 0;
 async function autobotTick() {
   if (!autobot.enabled || autoState.running) return;
@@ -1097,7 +1122,14 @@ async function autobotTick() {
       return;
     }
     if (!cands.length) { autoState.lastAction = { at: autoState.lastScanAt, status: 'waiting', message: 'Nenhuma rota acima do mínimo' }; return; }
-    for (const o of cands.slice(0, 3)) {
+    // 1.12.0: ordenar por lucro esperado real (maker × taxa de preenchimento aprendida) e saltar rotas maker mortas
+    const learn = routeLearning();
+    const isMk = o => autobot.useMaker && o.type !== 'transfer' && o.maker?.realistic && o.maker.netProfit > o.netProfit && o.maker.netPct >= MIN_PROFIT_PCT;
+    const ev = o => { if (!isMk(o)) return Math.max(o.netProfit, o.preview.maxNetProfit); const r = learn.get(routeKey(o.symbol, o.buyExchange, o.sellExchange)); return o.maker.netProfit * (r ? r.fillRate : 0.5); };
+    const live = cands.filter(o => !(isMk(o) && !o.preview.meetsMin && learn.get(routeKey(o.symbol, o.buyExchange, o.sellExchange))?.dead)).sort((a, b) => ev(b) - ev(a));
+    autoState.skippedDead = cands.length - live.length;
+    if (!live.length) { autoState.lastAction = { at: autoState.lastScanAt, status: 'waiting', message: `Só rotas maker em pausa (falharam ${DEAD_MIN_TRIES}+ vezes sem preencher)` }; return; }
+    for (const o of live.slice(0, 3)) {
       const args = { buyExchange: o.buyExchange, sellExchange: o.sellExchange, symbol: o.symbol, amount: o.preview.maxAmount > 0 ? Math.min(o.preview.maxAmount, autobot.amount) : autobot.amount, source: 'autobot' };
       const useMk = autobot.useMaker && o.type !== 'transfer' && o.maker?.realistic && o.maker.netProfit > o.netProfit && o.maker.netPct >= MIN_PROFIT_PCT;
       if (useMk) args.amount = autobot.amount;
@@ -1121,7 +1153,7 @@ function scheduleAutobot() {
   autoTimer = setTimeout(async () => { await autobotTick(); scheduleAutobot(); }, autobot.intervalSec * 1000);
 }
 function autobotStatus() {
-  return { ok: true, dryRun: DRY_RUN, stopped: STOPPED, config: autobot, state: autoState,
+  return { ok: true, dryRun: DRY_RUN, stopped: STOPPED, config: autobot, state: autoState, learning: learningSummary(),
     message: autobot.enabled ? (DRY_RUN ? 'Autobot ligado em SIMULAÇÃO (DRY_RUN): nenhuma ordem real é enviada' : 'Autobot ligado em MODO REAL') : 'Autobot desligado' };
 }
 app.get('/api/autobot', wrap(async (req, res) => res.json(autobotStatus())));
