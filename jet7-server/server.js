@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.13.0';
+const VERSION = '1.14.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -1081,10 +1081,12 @@ function routeLearning() {
   return map;
 }
 function stats24h() {
-  const since = new Date(Date.now() - 86400000).toISOString(), st = { since, maker: { tries: 0, fills: 0, profit: 0 }, taker: { sims: 0, executed: 0, profit: 0 }, triangular: { sims: 0, profit: 0 }, transfer: { started: 0 }, held: 0 };
+  const since = new Date(Date.now() - 86400000).toISOString(), st = { since, maker: { tries: 0, fills: 0, profit: 0 }, taker: { sims: 0, executed: 0, profit: 0 }, triangular: { sims: 0, profit: 0 }, transfer: { started: 0 }, held: 0, rebalance: { count: 0, cost: 0 }, ignoredNoKeys: 0 };
   for (const t of readJSON(HIST_FILE, [])) {
     if (t.at < since || t.source === 'client') continue;
     if (t.status === 'held') { st.held++; continue; }
+    if (t.type === 'rebalance') { st.rebalance.count++; st.rebalance.cost += -(t.netProfit || 0); continue; }
+    if ((t.buyExchange && !hasKeys(t.buyExchange)) || (t.sellExchange && !hasKeys(t.sellExchange))) { st.ignoredNoKeys++; continue; }
     if (t.type === 'maker') { st.maker.tries++; if ((t.filled || 0) > 0) { st.maker.fills++; st.maker.profit += t.netProfit || 0; } }
     else if (t.type === 'triangular') { if (t.status === 'dry_run' || t.status === 'executed') { st.triangular.sims++; st.triangular.profit += t.netProfit || 0; } }
     else if (t.type === 'transfer') st.transfer.started++;
@@ -1092,12 +1094,38 @@ function stats24h() {
     else if (t.status === 'executed') { st.taker.executed++; st.taker.profit += t.netProfit || 0; }
   }
   for (const k of ['maker', 'taker', 'triangular']) st[k].profit = Math.round(st[k].profit * 10000) / 10000;
-  st.totalProfit = Math.round((st.maker.profit + st.taker.profit + st.triangular.profit) * 10000) / 10000;
+  st.rebalance.cost = Math.round(st.rebalance.cost * 10000) / 10000;
+  st.totalProfit = Math.round((st.maker.profit + st.taker.profit + st.triangular.profit - st.rebalance.cost) * 10000) / 10000;
   return st;
 }
 function learningSummary() {
   return [...routeLearning().entries()].map(([k, r]) => ({ route: k.replace(/\|/g, ' '), tries: r.tries, fills: r.fills, fillRatePct: Math.round(r.fillRate * 1000) / 10, profit: Math.round(r.profit * 10000) / 10000, paused: r.dead, pausedUntil: r.dead ? r.pausedUntil : null }))
     .sort((a, b) => b.fills - a.fills || b.tries - a.tries).slice(0, 15);
+}
+// ---------- 1.14.0: simulação realista do Autobot do dono ----------
+// 1) só corretoras com chaves (a Bybit sem chaves não conta); 2) a mesma rota só repete passados SIM_REPEAT_MIN minutos
+// (a liquidez apanhada não volta logo); 3) inventário virtual: compra gasta USDT na corretora de compra e venda gasta a moeda
+// na de venda; quando um lado acaba, simula o reequilíbrio com custo SIM_REBAL_FEE USDT por transferência.
+const SIM_REPEAT_MIN = Number(process.env.SIM_REPEAT_MIN ?? 10), SIM_INV_OPS = Number(process.env.SIM_INV_OPS ?? 4), SIM_REBAL_FEE = Number(process.env.SIM_REBAL_FEE ?? 0.5);
+const SIM_INV_FILE = path.join(DATA_DIR, 'sim-inventory.json');
+let simInv = readJSON(SIM_INV_FILE, {});
+const simRepeat = new Map();
+function simBal(ex, coin) { simInv[ex] = simInv[ex] || {}; if (simInv[ex][coin] == null) simInv[ex][coin] = SIM_INV_OPS * (autobot.amount || DEFAULT_AMOUNT); return simInv[ex][coin]; }
+// devolve null se cabe; se não cabe, simula o reequilíbrio (custo) e devolve o registo
+function simReserve(o, amt) {
+  const [base, q] = o.symbol.split('/'), price = (o.preview.invest || amt) / Math.max(o.amount || amt, 1e-9), cost = amt * price;
+  const need = [];
+  if (simBal(o.buyExchange, q) < cost * 1.002) need.push({ coin: q, to: o.buyExchange, from: o.sellExchange });
+  if (simBal(o.sellExchange, base) < amt) need.push({ coin: base, to: o.sellExchange, from: o.buyExchange });
+  let fee = 0;
+  for (const n of need) { const full = SIM_INV_OPS * autobot.amount; const moved = Math.max(full - simBal(n.to, n.coin), 0); simInv[n.from][n.coin] = Math.max(simBal(n.from, n.coin) - moved, 0); simInv[n.to][n.coin] = full; fee += SIM_REBAL_FEE; }
+  return { fee, need };
+}
+function simApply(o, amt, netProfit) {
+  const [base, q] = o.symbol.split('/'), price = (o.preview.invest || amt) / Math.max(o.amount || amt, 1e-9), cost = amt * price;
+  simInv[o.buyExchange][q] = simBal(o.buyExchange, q) - cost; simInv[o.buyExchange][base] = simBal(o.buyExchange, base) + amt;
+  simInv[o.sellExchange][base] = simBal(o.sellExchange, base) - amt; simInv[o.sellExchange][q] = simBal(o.sellExchange, q) + cost + (netProfit || 0);
+  writeJSON(SIM_INV_FILE, simInv);
 }
 const TRANSFER_SCAN_MIN = Number(process.env.TRANSFER_SCAN_MIN ?? 15); let lastTransferScan = 0;
 async function autobotTick() {
@@ -1123,15 +1151,16 @@ async function autobotTick() {
       (o.preview.meetsMin || (autobot.useMaker && o.type !== 'transfer' && o.maker?.realistic && o.maker.netPct >= MIN_PROFIT_PCT) || (o.preview.maxNetProfit > 0 && o.preview.maxAmount <= autobot.amount)) && Math.max(o.netProfit, o.preview.maxNetProfit) >= autobot.minProfitUsdt &&
       (!autobot.symbols.length || autobot.symbols.includes(o.symbol)) &&
       (!autobot.exchanges.length || (autobot.exchanges.includes(o.buyExchange) && autobot.exchanges.includes(o.sellExchange))) &&
-      (DRY_RUN || (hasKeys(o.buyExchange) && hasKeys(o.sellExchange))) &&
-      !((routeCooldown.get(o.id) || 0) > now));
+      hasKeys(o.buyExchange) && hasKeys(o.sellExchange) &&
+      !((routeCooldown.get(o.id) || 0) > now) && !((simRepeat.get(o.id) || 0) > now));
     autoState.lastBestTriangle = p2.opportunities[0] ? { id: p2.opportunities[0].id, netPct: p2.opportunities[0].netPct, netProfit: p2.opportunities[0].netProfit } : null;
     autoState.lastBest = data.opportunities[0] ? { id: data.opportunities[0].id, netPct: data.opportunities[0].netPct, netProfit: data.opportunities[0].netProfit, maxNetProfit: data.opportunities[0].preview.maxNetProfit } : null;
     // triangulares (mesma corretora): executa a melhor se passar o mínimo e for melhor do que a melhor rota entre corretoras
-    const tri = p2.opportunities.find(o => o.meetsMin && o.netProfit >= autobot.minProfitUsdt && !((routeCooldown.get(o.id) || 0) > now) && (DRY_RUN || hasKeys(o.exchange)) && (!autobot.exchanges.length || autobot.exchanges.includes(o.exchange)));
+    const tri = p2.opportunities.find(o => o.meetsMin && o.netProfit >= autobot.minProfitUsdt && !((routeCooldown.get(o.id) || 0) > now) && !((simRepeat.get(o.id) || 0) > now) && hasKeys(o.exchange) && (!autobot.exchanges.length || autobot.exchanges.includes(o.exchange)));
     if (tri && (!cands.length || tri.netProfit >= Math.max(cands[0].netProfit, cands[0].preview.maxNetProfit))) {
       const r = await executeTriangle({ exchange: tri.exchange, path: tri.path, amount: autobot.amount, source: 'autobot' }); const b = r.body || {};
       routeCooldown.set(tri.id, Date.now() + autobot.cooldownSec * 1000);
+      if (DRY_RUN) simRepeat.set(tri.id, Date.now() + SIM_REPEAT_MIN * 60000);
       autoState.lastAction = { at: new Date().toISOString(), route: tri.id, status: b.status, netProfit: b.netProfit ?? 0, message: b.message || b.error };
       if (b.status === 'dry_run') { autoState.simulated++; autoState.profitUsdt += b.netProfit || 0; }
       if (b.status === 'executed') { autoState.trades++; autoState.profitUsdt += b.netProfit || 0; }
@@ -1153,6 +1182,8 @@ async function autobotTick() {
       const useMk = isMk(o) && !(lr && lr.dead) && (!takerOk || o.maker.netProfit * (lr ? lr.fillRate : 0.5) > Math.max(o.netProfit, o.preview.maxNetProfit));
       if (!useMk && !takerOk) continue;   // nem maker viável nem taker com lucro: não gasta tentativa
       if (useMk) args.amount = autobot.amount;
+      let rebal = null;
+      if (DRY_RUN && !useMk && o.type !== 'transfer') { rebal = simReserve({ ...o, amount: o.amount || args.amount }, args.amount); }
       const r = o.type === 'transfer' ? await executeTransfer(args) : useMk ? await executeMaker(args) : await executeRoute(args);
       const b = r.body || {};
       autoState.lastAction = { at: new Date().toISOString(), route: o.id, status: b.status || (b.ok ? 'ok' : 'error'), netProfit: b.netProfit ?? 0, message: b.message || b.error };
@@ -1161,7 +1192,14 @@ async function autobotTick() {
       if (b.status === 'running') { autoState.trades++; break; }
       if (b.status === 'executed') { autoState.trades++; autoState.profitUsdt += b.netProfit || 0; }
       if (b.status === 'not_filled') { autoState.lastAction.message = b.message; break; }
-      if (b.status === 'dry_run') { autoState.simulated++; autoState.profitUsdt += b.netProfit || 0; }
+      if (b.status === 'dry_run') {
+        autoState.simulated++; autoState.profitUsdt += b.netProfit || 0;
+        if (!useMk && o.type !== 'transfer') {
+          simRepeat.set(o.id, Date.now() + SIM_REPEAT_MIN * 60000);
+          if (rebal && rebal.fee > 0) { record({ source: 'autobot', type: 'rebalance', status: 'dry_run', symbol: o.symbol, buyExchange: o.buyExchange, sellExchange: o.sellExchange, netProfit: -rebal.fee, moves: rebal.need, message: `Reequilíbrio simulado (${rebal.need.map(n => n.coin + '→' + n.to).join(', ')}) — custo ${rebal.fee} USDT` }); autoState.profitUsdt -= rebal.fee; }
+          simApply({ ...o, amount: o.amount || args.amount }, b.amount || args.amount, b.netProfit);
+        }
+      }
       break;
     }
   } catch (e) { autoState.lastError = { at: new Date().toISOString(), message: e.message }; }
@@ -1174,6 +1212,7 @@ function scheduleAutobot() {
 }
 function autobotStatus() {
   return { ok: true, dryRun: DRY_RUN, stopped: STOPPED, config: autobot, state: autoState, last24h: stats24h(), learning: learningSummary(),
+    simulation: { repeatMin: SIM_REPEAT_MIN, inventoryOps: SIM_INV_OPS, rebalanceFeeUsdt: SIM_REBAL_FEE, inventory: simInv },
     message: autobot.enabled ? (DRY_RUN ? 'Autobot ligado em SIMULAÇÃO (DRY_RUN): nenhuma ordem real é enviada' : 'Autobot ligado em MODO REAL') : 'Autobot desligado' };
 }
 app.get('/api/autobot', wrap(async (req, res) => res.json(autobotStatus())));
