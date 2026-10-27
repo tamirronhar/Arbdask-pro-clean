@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.9.7';
+const VERSION = '1.10.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -530,14 +530,17 @@ app.post('/api/execute', wrap(async (req, res) => {
 async function executeRoute(input) {
   const send = (code, body) => ({ code, body });
   const source = input.source || 'manual';
-  if (STOPPED) return send(423, { ok: false, status: 'aborted', message: 'Bot parado pelo botão de emergência' });
+  // 1.10.0: contexto por cliente (chaves, limites e histórico próprios); sem contexto = conta do dono
+  const gx = input.getEx || client, hk = input.hasKeys || hasKeys, rec = input.record || record, dry = DRY_RUN || !!input.forceDry;
+  const maxQ = input.maxOrder ?? MAX_ORDER_QUOTE;
+  if (STOPPED || (input.isStopped && input.isStopped())) return send(423, { ok: false, status: 'aborted', message: 'Bot parado pelo botão de emergência' });
   const { buyExchange, sellExchange, symbol } = input;
   const amount = Number(input.amount);
   if (!EXCHANGES.includes(buyExchange) || !EXCHANGES.includes(sellExchange) || buyExchange === sellExchange)
     return send(400, { ok: false, error: 'Corretoras inválidas' });
   if (!SYMBOLS.includes(symbol)) return send(400, { ok: false, error: 'Par não permitido' });
   if (!(amount > 0)) return send(400, { ok: false, error: 'Quantidade inválida' });
-  if (!DRY_RUN && (!hasKeys(buyExchange) || !hasKeys(sellExchange)))
+  if (!dry && (!hk(buyExchange) || !hk(sellExchange)))
     return send(400, { ok: false, error: 'Faltam chaves API nas duas corretoras' });
 
   const [base, quoteCur] = symbol.split('/');
@@ -548,20 +551,20 @@ async function executeRoute(input) {
     let q = await quote(buyExchange, sellExchange, symbol, amount);
     last = q;
     if (!q) { await sleep(1500); continue; }
-    if (q.amount * q.buyPrice > MAX_ORDER_QUOTE)
-      return send(400, { ok: false, status: 'aborted', message: `Acima do limite por operação (${MAX_ORDER_QUOTE} ${quoteCur})` });
+    if (q.amount * q.buyPrice > maxQ)
+      return send(400, { ok: false, status: 'aborted', message: `Acima do limite por operação (${maxQ} ${quoteCur})` });
 
     // PROTEÇÃO ANTI-PERDA: só avança com lucro líquido acima do mínimo
     if (q.netPct < MIN_PROFIT_PCT) { await sleep(1500 * attempt); continue; }
 
-    if (DRY_RUN) {
+    if (dry) {
       const t = { status: 'dry_run', symbol, buyExchange, sellExchange, amount, netProfit: q.netProfit, netPct: q.netPct, attempts: attempt, preview: q.preview };
-      record({ source, ...t });
+      rec({ source, ...t });
       return send(200, { ok: true, ...t, message: `Simulação: lucro líquido ${q.netProfit.toFixed(4)} ${quoteCur} (${q.netPct.toFixed(3)}%) — nenhuma ordem enviada (DRY_RUN)`, orders: [] });
     }
 
     // saldo suficiente nos dois lados (o dinheiro já está em cada corretora)
-    const bx = client(buyExchange), sx = client(sellExchange);
+    const bx = gx(buyExchange), sx = gx(sellExchange);
     const [bBal, sBal] = await Promise.all([bx.fetchBalance(), sx.fetchBalance()]);
     if ((bBal.free[quoteCur] ?? 0) < amount * q.buyLimit * 1.002 || (sBal.free[base] ?? 0) < amount)
       return send(200, { ok: true, status: 'aborted', attempts: attempt, netProfit: 0, message: `Saldo insuficiente: precisa de ${quoteCur} na ${buyExchange} e ${base} na ${sellExchange}`, orders: [] });
@@ -587,9 +590,9 @@ async function executeRoute(input) {
       orders.push(...fix.orders); fb = fix.fb; fsl = fix.fsl;
     }
     const ok = fb > 0 && Math.abs(fb - fsl) <= amt * 0.01;
-    if (!ok && (fb > 0 || fsl > 0)) setStopped(true); // continua desequilibrada: pára tudo até o utilizador verificar
+    if (!ok && (fb > 0 || fsl > 0)) { if (input.onImbalance) input.onImbalance(); else setStopped(true); } // continua desequilibrada: pára tudo até o utilizador verificar
     const t = { status: ok ? 'executed' : (fb > 0 || fsl > 0) ? 'partial' : 'aborted', symbol, buyExchange, sellExchange, amount: amt, netProfit: ok ? q.netProfit : 0, netPct: q.netPct, attempts: attempt, preview: q.preview, orders };
-    record({ source, ...t });
+    rec({ source, ...t });
     return send(200, { ok: true, ...t, message: ok
       ? `Executado: lucro estimado ${q.netProfit.toFixed(4)} ${quoteCur}`
       : (fb > 0 || fsl > 0)
@@ -597,7 +600,7 @@ async function executeRoute(input) {
         : 'Nenhuma ordem executou (preço mudou antes) — sem perda' });
   }
   const t = { status: 'held', symbol, buyExchange, sellExchange, amount, netProfit: 0, attempts: MAX_ATTEMPTS, lastNetPct: last?.netPct ?? null };
-  record({ source, ...t });
+  rec({ source, ...t });
   return send(200, { ok: true, ...t, message: `Sem lucro após ${MAX_ATTEMPTS} recálculos — nenhuma ordem enviada, saldo mantido`, orders: [] });
 }
 
@@ -933,6 +936,7 @@ const AUTOBOT_DEFAULT = { enabled: false, useMaker: false, routeTypes: ['simulta
 let autobot = { ...AUTOBOT_DEFAULT, ...readJSON(AUTOBOT_FILE, {}) };
 const autoState = { running: false, lastScanAt: null, lastScanMs: null, lastBest: null, lastAction: null, lastError: null, trades: 0, simulated: 0, profitUsdt: 0, startedAt: null };
 const routeCooldown = new Map();
+let lastSharedScan = { at: 0, amount: 0, list: [] }; // última pesquisa do Autobot do dono, reutilizada pelos Autobots dos clientes
 let autoTimer = null;
 
 function sanitizeAutobot(c) {
@@ -980,6 +984,7 @@ async function autobotTick() {
     const score = o => Math.max(o.preview.maxNetProfit, autobot.useMaker && o.maker?.realistic ? o.maker.netProfit : 0);
     const data = { opportunities: parts[0].opportunities.concat(parts[1].opportunities).sort((x, y) => (score(y) - score(x)) || (y.netProfit - x.netProfit)) };
     autoState.lastScanAt = new Date().toISOString(); autoState.lastScanMs = Date.now() - t0;
+    if (types.includes('simultanea')) lastSharedScan = { at: Date.now(), amount: autobot.amount, list: p0.opportunities };
     const now = Date.now();
     const cands = data.opportunities.filter(o =>
       (o.preview.meetsMin || (autobot.useMaker && o.type !== 'transfer' && o.maker?.realistic && o.maker.netPct >= MIN_PROFIT_PCT) || (o.preview.maxNetProfit > 0 && o.preview.maxAmount <= autobot.amount)) && Math.max(o.netProfit, o.preview.maxNetProfit) >= autobot.minProfitUsdt &&
@@ -1218,6 +1223,260 @@ app.post('/api/licenses/:key/revoke', wrap(async (req, res) => {
   if (!l) return res.status(404).json({ ok: false, error: 'Licença não encontrada' });
   l.revoked = true; savePay(); res.json({ ok: true });
 }));
+
+// ---------- 1.10.0: contas de cliente (multi-cliente) ----------
+// Cada cliente cria conta (email + palavra-passe), guarda as SUAS chaves API (encriptadas com AES-256-GCM)
+// e usa o mesmo motor do dono. O plano da licença decide o que pode fazer:
+//   Teste: só simulação manual · Manual: execução manual · Pro/Pro Anual: execução manual + Autobot 24h.
+// Enquanto DRY_RUN=true no servidor, tudo é simulação para toda a gente.
+const GIST_USERS = 'jet7-users.json';
+const FEATURES = {
+  teste:    { manual: true, autobot: false, forceDry: true,  opsPerDay: 20,   maxOrder: 100 },
+  manual:   { manual: true, autobot: false, forceDry: false, opsPerDay: 50,   maxOrder: 2000 },
+  pro:      { manual: true, autobot: true,  forceDry: false, opsPerDay: 1e9,  maxOrder: 10000 },
+  proanual: { manual: true, autobot: true,  forceDry: false, opsPerDay: 1e9,  maxOrder: 10000 },
+};
+const PLAN_RANK = { teste: 1, manual: 2, pro: 3, proanual: 4 };
+const CLI_AUTOBOT_DEFAULT = { enabled: false, amount: DEFAULT_AMOUNT, minProfitUsdt: 0, cooldownSec: 120, symbols: [], exchanges: [] };
+let users = [], usersSaveTimer = null;
+const SESSION_KEY = crypto.createHash('sha256').update(MASTER_KEY + ':jet7-session').digest();
+function saveUsers() {
+  clearTimeout(usersSaveTimer);
+  usersSaveTimer = setTimeout(async () => {
+    if (!GH_TOKEN) return;
+    try { await gh('/gists/' + await findOrCreateGist(), { method: 'PATCH', body: JSON.stringify({ files: { [GIST_USERS]: { content: JSON.stringify({ users }) } } }) }); }
+    catch (e) { console.warn('Gist utilizadores: ' + e.message); }
+  }, 2000);
+}
+async function loadUsers() {
+  if (!GH_TOKEN) return;
+  try {
+    const g = await gh('/gists/' + await findOrCreateGist());
+    const f = g.files && g.files[GIST_USERS];
+    if (f && f.content) { users = JSON.parse(f.content).users || []; console.log(`Contas de cliente carregadas: ${users.length}`); }
+  } catch (e) { console.warn('Gist utilizadores: ' + e.message); }
+}
+setTimeout(loadUsers, 6000);
+function hashPw(pw, salt = crypto.randomBytes(16).toString('hex')) { return 'scrypt$' + salt + '$' + crypto.scryptSync(pw, salt, 32).toString('hex'); }
+function checkPw(pw, stored) {
+  const [, salt, h] = String(stored).split('$'); if (!salt || !h) return false;
+  const a = crypto.scryptSync(pw, salt, 32), b = Buffer.from(h, 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+const b64u = b => Buffer.from(b).toString('base64url');
+function signSession(u) {
+  const body = b64u(JSON.stringify({ u: u.id, v: u.tv || 0, exp: Date.now() + 30 * 86400000 }));
+  return 'c1.' + body + '.' + crypto.createHmac('sha256', SESSION_KEY).update(body).digest('base64url');
+}
+function readSession(tok) {
+  const [p, body, sig] = String(tok || '').split('.');
+  if (p !== 'c1' || !body || !sig) return null;
+  const good = crypto.createHmac('sha256', SESSION_KEY).update(body).digest('base64url');
+  if (good.length !== sig.length || !crypto.timingSafeEqual(Buffer.from(good), Buffer.from(sig))) return null;
+  try { const d = JSON.parse(Buffer.from(body, 'base64url').toString()); if (d.exp < Date.now()) return null; const u = users.find(x => x.id === d.u); return u && (u.tv || 0) === d.v && !u.disabled ? u : null; } catch { return null; }
+}
+function bestLicense(email) {
+  const now = Date.now();
+  return pay.licenses.filter(l => l.email === email && !l.revoked && new Date(l.expiresAt).getTime() > now)
+    .sort((a, b) => (PLAN_RANK[b.plan] - PLAN_RANK[a.plan]) || b.expiresAt.localeCompare(a.expiresAt))[0] || null;
+}
+const featuresOf = u => { const l = bestLicense(u.email); return l ? { plan: l.plan, planName: l.planName, expiresAt: l.expiresAt, licenseKey: l.key, ...FEATURES[l.plan] } : null; };
+const userKeys = u => Object.keys(u.keys || {});
+const pubUser = u => { const f = featuresOf(u); return { id: u.id, email: u.email, createdAt: u.createdAt, exchanges: userKeys(u), license: f ? { plan: f.plan, planName: f.planName, expiresAt: f.expiresAt, key: f.licenseKey } : null, features: f ? { manual: f.manual, autobot: f.autobot, simulationOnly: f.forceDry || DRY_RUN, opsPerDay: f.opsPerDay >= 1e9 ? null : f.opsPerDay, maxOrder: f.maxOrder } : null, autobot: { enabled: !!u.autobot?.enabled } }; };
+
+// limite de tentativas de login/registo por IP (10 em 10 min)
+const loginHits = new Map();
+function tooMany(req) {
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim(), now = Date.now();
+  const h = (loginHits.get(ip) || []).filter(t => now - t < 600000); h.push(now); loginHits.set(ip, h);
+  if (loginHits.size > 5000) loginHits.clear();
+  return h.length > 10;
+}
+app.post('/public/account/register', (req, res) => {
+  if (tooMany(req)) return res.status(429).json({ ok: false, error: 'Demasiadas tentativas. Espere 10 minutos.' });
+  const email = String(req.body?.email || '').trim().toLowerCase(), pw = String(req.body?.password || '');
+  if (!okEmail(email)) return res.status(400).json({ ok: false, error: 'Email inválido' });
+  if (pw.length < 8) return res.status(400).json({ ok: false, error: 'A palavra-passe precisa de pelo menos 8 caracteres' });
+  if (users.some(u => u.email === email)) return res.status(400).json({ ok: false, error: 'Já existe uma conta com este email. Entre com a palavra-passe.' });
+  if (users.length >= 1000) return res.status(429).json({ ok: false, error: 'Limite de contas atingido' });
+  const u = { id: crypto.randomBytes(8).toString('hex'), email, pass: hashPw(pw), createdAt: nowIso(), lastLoginAt: nowIso(), keys: {}, autobot: { ...CLI_AUTOBOT_DEFAULT }, hist: [] };
+  users.push(u); saveUsers();
+  res.json({ ok: true, token: signSession(u), account: pubUser(u) });
+});
+app.post('/public/account/login', (req, res) => {
+  if (tooMany(req)) return res.status(429).json({ ok: false, error: 'Demasiadas tentativas. Espere 10 minutos.' });
+  const email = String(req.body?.email || '').trim().toLowerCase(), pw = String(req.body?.password || '');
+  const u = users.find(x => x.email === email);
+  if (!u || !checkPw(pw, u.pass)) return res.status(401).json({ ok: false, error: 'Email ou palavra-passe errados' });
+  if (u.disabled) return res.status(403).json({ ok: false, error: 'Conta suspensa. Contacte o suporte.' });
+  u.lastLoginAt = nowIso(); saveUsers();
+  res.json({ ok: true, token: signSession(u), account: pubUser(u) });
+});
+
+// tudo em /client exige sessão de cliente válida
+app.use('/client', (req, res, next) => {
+  const h = req.headers.authorization || '';
+  const u = readSession(h.startsWith('Bearer ') ? h.slice(7) : '');
+  if (!u) return res.status(401).json({ ok: false, error: 'Sessão inválida. Entre de novo.' });
+  req.user = u; req.feat = featuresOf(u); next();
+});
+const needPlan = (req, res, what) => {
+  if (!req.feat) { res.status(402).json({ ok: false, error: 'Precisa de um plano ativo. Escolha um plano na secção Planos.' }); return false; }
+  if (what && !req.feat[what]) { res.status(403).json({ ok: false, error: what === 'autobot' ? 'O Autobot está incluído nos planos Pro e Pro Anual.' : 'O seu plano não inclui esta função.' }); return false; }
+  return true;
+};
+app.get('/client/me', (req, res) => res.json({ ok: true, account: pubUser(req.user) }));
+app.post('/client/password', (req, res) => {
+  const { current, password } = req.body || {};
+  if (!checkPw(String(current || ''), req.user.pass)) return res.status(400).json({ ok: false, error: 'Palavra-passe atual errada' });
+  if (String(password || '').length < 8) return res.status(400).json({ ok: false, error: 'Mínimo 8 caracteres' });
+  req.user.pass = hashPw(String(password)); req.user.tv = (req.user.tv || 0) + 1; saveUsers();
+  res.json({ ok: true, token: signSession(req.user) });
+});
+// associar uma licença comprada com outro email
+app.post('/client/link-license', (req, res) => {
+  const l = pay.licenses.find(x => x.key === String(req.body?.key || '').trim().toUpperCase());
+  if (!l) return res.status(404).json({ ok: false, error: 'Licença não encontrada' });
+  if (l.email !== req.user.email && users.some(u => u.email === l.email)) return res.status(400).json({ ok: false, error: 'Esta licença pertence a outra conta' });
+  l.email = req.user.email; savePay();
+  res.json({ ok: true, account: pubUser(req.user) });
+});
+
+// clientes ccxt por cliente: poucos em memória ao mesmo tempo (Render Free) e com os mercados partilhados do dono
+const userEx = new Map(); const USER_EX_MAX = 8;
+function userClient(u, id) {
+  const k = u.id + ':' + id; let ex = userEx.get(k);
+  if (ex) { userEx.delete(k); userEx.set(k, ex); return ex; }
+  if (!u.keys?.[id]) throw new Error('Sem chave da ' + id);
+  ex = new ccxt[id]({ enableRateLimit: true, timeout: 15000, options: spotOpts(id), ...dec(u.keys[id]) });
+  ex.loadMarkets = async () => { if (!ex.markets) ex.setMarkets(Object.values(await ensureMarkets(client(id)))); return ex.markets; };
+  userEx.set(k, ex);
+  while (userEx.size > USER_EX_MAX) userEx.delete(userEx.keys().next().value);
+  return ex;
+}
+const dropUserEx = u => { for (const k of [...userEx.keys()]) if (k.startsWith(u.id + ':')) userEx.delete(k); };
+function userRecord(u) { return t => { u.hist = [{ at: nowIso(), ...t }, ...(u.hist || [])].slice(0, 200); saveUsers(); }; }
+const opsToday = u => { const d = new Date().toISOString().slice(0, 10); return (u.hist || []).filter(t => String(t.at).startsWith(d) && ['dry_run', 'executed', 'partial'].includes(t.status)).length; };
+function userCtx(u, f) {
+  return { getEx: id => userClient(u, id), hasKeys: id => !!u.keys?.[id], record: userRecord(u), forceDry: !!f.forceDry, maxOrder: Math.min(f.maxOrder, MAX_ORDER_QUOTE * 50),
+    isStopped: () => !!u.stopped, onImbalance: () => { u.stopped = true; u.autobot.enabled = false; saveUsers(); } };
+}
+
+app.get('/client/health', (req, res) => {
+  const u = req.user, f = req.feat;
+  res.json({ ok: true, client: true, version: VERSION, dryRun: DRY_RUN || !!f?.forceDry, stopped: !!u.stopped, symbols: SYMBOLS, minProfitPct: MIN_PROFIT_PCT,
+    maxOrderQuote: f ? f.maxOrder : 0, account: pubUser(u), autobot: { enabled: !!u.autobot?.enabled }, exchanges: EXCHANGES.map(id => ({ id, keys: !!u.keys?.[id] })) });
+});
+app.post('/client/keys', wrap(async (req, res) => {
+  if (!needPlan(req, res)) return;
+  const { exchange, apiKey, secret, password } = req.body || {};
+  if (!EXCHANGES.includes(exchange)) return res.status(400).json({ ok: false, error: 'Corretora não suportada' });
+  if (!apiKey || !secret) return res.status(400).json({ ok: false, error: 'API Key e Secret são obrigatórios' });
+  const creds = { apiKey: String(apiKey).trim(), secret: String(secret).trim() }; if (password) creds.password = String(password).trim();
+  const test = new ccxt[exchange]({ enableRateLimit: true, timeout: 15000, options: spotOpts(exchange), ...creds });
+  test.loadMarkets = async () => { if (!test.markets) test.setMarkets(Object.values(await ensureMarkets(client(exchange)))); return test.markets; };
+  try { await test.fetchBalance(); } catch (e) { return res.status(400).json({ ok: false, error: 'Chave recusada pela corretora: ' + e.message }); }
+  req.user.keys = req.user.keys || {}; req.user.keys[exchange] = enc(creds); dropUserEx(req.user); saveUsers();
+  res.json({ ok: true });
+}));
+app.delete('/client/keys/:exchange', (req, res) => { if (req.user.keys) delete req.user.keys[req.params.exchange]; dropUserEx(req.user); saveUsers(); res.json({ ok: true }); });
+app.get('/client/balances', wrap(async (req, res) => {
+  if (!needPlan(req, res)) return;
+  const out = [];
+  for (const id of userKeys(req.user)) {   // uma de cada vez: poupa memória
+    try { const b = await userClient(req.user, id).fetchBalance(); const o = { exchange: id }; for (const c of COINS) o[c] = b.total[c] ?? 0; out.push(o); }
+    catch (e) { out.push({ exchange: id, error: e.message }); }
+  }
+  res.json({ ok: true, balances: out });
+}));
+// oportunidades e previsões usam só dados públicos de mercado (partilhados com o dono)
+app.get('/client/opportunities', wrap(async (req, res) => {
+  if (!needPlan(req, res)) return;
+  const amount = Math.min(Number(req.query.amount) || DEFAULT_AMOUNT, req.feat.maxOrder);
+  const key = amount + '|';
+  if (oppCache.key === key && oppCache.data && Date.now() - oppCache.at < 8000) return res.json(oppCache.data);
+  if (oppCache.pending) return res.json(await oppCache.pending);
+  oppCache.key = key; oppCache.pending = scanOpps(amount, false);
+  try { oppCache.data = await oppCache.pending; oppCache.at = Date.now(); } finally { oppCache.pending = null; }
+  res.json(oppCache.data);
+}));
+app.get('/client/preview', wrap(async (req, res) => {
+  if (!needPlan(req, res)) return;
+  const { buy, sell, symbol } = req.query; const amount = Math.min(Number(req.query.amount) || DEFAULT_AMOUNT, req.feat.maxOrder);
+  if (!EXCHANGES.includes(buy) || !EXCHANGES.includes(sell) || buy === sell) return res.status(400).json({ ok: false, error: 'Corretoras inválidas' });
+  if (!SYMBOLS.includes(symbol)) return res.status(400).json({ ok: false, error: 'Par não permitido' });
+  const q = await quote(buy, sell, symbol, amount);
+  if (!q) return res.json({ ok: true, available: false, message: 'Livro sem profundidade suficiente para esta quantidade' });
+  const p = q.preview, c = q.quote;
+  res.json({ ok: true, available: true, ...q, dryRun: DRY_RUN || req.feat.forceDry,
+    message: `Previsão: investe ${p.invest.toFixed(4)} ${c}, recebe ${p.revenue.toFixed(4)} ${c}, taxas ${p.feesTotal.toFixed(4)} ${c} → lucro líquido ${p.netProfit.toFixed(4)} ${c} (${p.netPct.toFixed(3)}%). ` + (p.meetsMin ? 'Passa o mínimo.' : `Abaixo do mínimo de ${MIN_PROFIT_PCT}% — não executaria.`) });
+}));
+app.post('/client/execute', wrap(async (req, res) => {
+  if (!needPlan(req, res, 'manual')) return;
+  if (opsToday(req.user) >= req.feat.opsPerDay) return res.status(429).json({ ok: false, error: `Limite do plano: ${req.feat.opsPerDay} operações por dia` });
+  const r = await executeRoute({ ...(req.body || {}), source: 'manual', ...userCtx(req.user, req.feat) });
+  res.status(r.code).json(r.body);
+}));
+app.get('/client/history', (req, res) => res.json({ ok: true, trades: (req.user.hist || []).slice(0, 200) }));
+app.post('/client/stop', (req, res) => { req.user.stopped = true; req.user.autobot.enabled = false; saveUsers(); res.json({ ok: true, stopped: true }); });
+app.post('/client/resume', (req, res) => { req.user.stopped = false; saveUsers(); res.json({ ok: true, stopped: false }); });
+
+// Autobot por cliente: reutiliza a pesquisa de mercado mais recente (não multiplica o trabalho por cliente)
+const cliState = new Map(); // id -> { lastAction, simulated, trades, profitUsdt, startedAt, cooldown: Map }
+const stOf = u => { let s = cliState.get(u.id); if (!s) { s = { lastAction: null, lastScanAt: null, simulated: 0, trades: 0, profitUsdt: 0, startedAt: null, cooldown: new Map() }; cliState.set(u.id, s); } return s; };
+function cliAutobotStatus(u) {
+  const s = stOf(u), f = featuresOf(u);
+  return { ok: true, dryRun: DRY_RUN || !!f?.forceDry, stopped: !!u.stopped, config: { ...CLI_AUTOBOT_DEFAULT, ...u.autobot, useMaker: false, routeTypes: ['simultanea'], intervalSec: 60 },
+    state: { running: false, lastScanAt: s.lastScanAt, lastAction: s.lastAction, simulated: s.simulated, trades: s.trades, profitUsdt: s.profitUsdt, startedAt: s.startedAt },
+    message: u.autobot?.enabled ? ((DRY_RUN || f?.forceDry) ? 'Autobot ligado em SIMULAÇÃO: nenhuma ordem real é enviada' : 'Autobot ligado em MODO REAL') : 'Autobot desligado' };
+}
+app.get('/client/autobot', (req, res) => res.json(cliAutobotStatus(req.user)));
+app.post('/client/autobot', (req, res) => {
+  const c = req.body || {}, u = req.user, a = { ...CLI_AUTOBOT_DEFAULT, ...u.autobot };
+  if (c.enabled === true && !needPlan(req, res, 'autobot')) return;
+  const max = req.feat ? req.feat.maxOrder : DEFAULT_AMOUNT;
+  if (typeof c.enabled === 'boolean') { if (c.enabled && !a.enabled) Object.assign(stOf(u), { startedAt: nowIso(), simulated: 0, trades: 0, profitUsdt: 0 }); a.enabled = c.enabled; }
+  if (c.amount != null) a.amount = Math.min(Math.max(Number(c.amount) || DEFAULT_AMOUNT, 1), max);
+  if (c.minProfitUsdt != null) a.minProfitUsdt = Math.max(Number(c.minProfitUsdt) || 0, 0);
+  if (c.cooldownSec != null) a.cooldownSec = Math.min(Math.max(Number(c.cooldownSec) || 0, 30), 86400);
+  if (Array.isArray(c.symbols)) a.symbols = c.symbols.filter(x => SYMBOLS.includes(x));
+  if (Array.isArray(c.exchanges)) a.exchanges = c.exchanges.filter(x => EXCHANGES.includes(x));
+  u.autobot = a; saveUsers(); res.json(cliAutobotStatus(u));
+});
+let cliTickRunning = false;
+async function clientAutobotTick() {
+  const active = users.filter(u => u.autobot?.enabled && !u.disabled && !u.stopped);
+  if (!active.length || cliTickRunning || STOPPED || memHigh()) return;
+  cliTickRunning = true;
+  try {
+    // pesquisa partilhada: usa a do Autobot do dono se tiver menos de 2 min; senão faz uma
+    if (Date.now() - lastSharedScan.at > 120000) { const r = await scanOpps(DEFAULT_AMOUNT, false); lastSharedScan = { at: Date.now(), amount: DEFAULT_AMOUNT, list: r.opportunities }; }
+    const now = Date.now();
+    for (const u of active) {
+      const f = featuresOf(u), s = stOf(u), a = u.autobot;
+      s.lastScanAt = new Date(lastSharedScan.at).toISOString();
+      if (!f || !f.autobot) { a.enabled = false; s.lastAction = { at: nowIso(), status: 'paused', message: 'Plano sem Autobot ou expirado' }; saveUsers(); continue; }
+      const dry = DRY_RUN || f.forceDry;
+      const cands = lastSharedScan.list.filter(o => o.type !== 'transfer' && o.preview?.meetsMin && Math.max(o.netProfit, o.preview.maxNetProfit) >= a.minProfitUsdt &&
+        (!a.symbols.length || a.symbols.includes(o.symbol)) && (!a.exchanges.length || (a.exchanges.includes(o.buyExchange) && a.exchanges.includes(o.sellExchange))) &&
+        (dry || (u.keys?.[o.buyExchange] && u.keys?.[o.sellExchange])) && !((s.cooldown.get(o.id) || 0) > now));
+      if (!cands.length) { s.lastAction = { at: nowIso(), status: 'waiting', message: 'Nenhuma rota acima do mínimo' }; continue; }
+      const o = cands[0];
+      const r = await executeRoute({ buyExchange: o.buyExchange, sellExchange: o.sellExchange, symbol: o.symbol, amount: Math.min(o.preview.maxAmount > 0 ? o.preview.maxAmount : a.amount, a.amount), source: 'autobot', ...userCtx(u, f) });
+      const b = r.body || {};
+      s.cooldown.set(o.id, Date.now() + (/Saldo insuficiente/.test(b.message || '') ? 600 : a.cooldownSec) * 1000);
+      s.lastAction = { at: nowIso(), route: o.id, status: b.status || (b.ok ? 'ok' : 'error'), netProfit: b.netProfit ?? 0, message: b.message || b.error };
+      if (b.status === 'dry_run') { s.simulated++; s.profitUsdt += b.netProfit || 0; }
+      if (b.status === 'executed') { s.trades++; s.profitUsdt += b.netProfit || 0; }
+    }
+  } catch (e) { console.warn('Autobot clientes: ' + e.message); }
+  finally { cliTickRunning = false; }
+}
+setInterval(clientAutobotTick, 60000);
+
+// admin (dono): lista de clientes, sem chaves nem palavras-passe
+app.get('/api/users', (req, res) => res.json({ ok: true, users: users.map(u => ({ ...pubUser(u), lastLoginAt: u.lastLoginAt, disabled: !!u.disabled, stopped: !!u.stopped, opsToday: opsToday(u), lastAction: stOf(u).lastAction, profitSimUsdt: (u.hist || []).filter(t => t.status === 'dry_run').reduce((x, t) => x + (t.netProfit || 0), 0) })) }));
+app.post('/api/users/:id/disable', (req, res) => { const u = users.find(x => x.id === req.params.id); if (!u) return res.status(404).json({ ok: false, error: 'Não encontrado' }); u.disabled = req.body?.disabled !== false; if (u.disabled) { u.autobot.enabled = false; u.tv = (u.tv || 0) + 1; } saveUsers(); res.json({ ok: true, disabled: u.disabled }); });
 app.get('/', (req, res) => res.type('text').send('JET7 server ' + VERSION));
 app.listen(PORT, () => console.log(`JET7 server ${VERSION} na porta ${PORT} — DRY_RUN=${DRY_RUN}`));
 // manter acordado no Render Free (adormece após 15 min sem visitas): ping ao próprio endereço público a cada 10 min
