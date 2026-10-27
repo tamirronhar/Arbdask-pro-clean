@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.10.0';
+const VERSION = '1.11.0';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -460,6 +460,80 @@ async function scanOpps(amount, all) {
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// ---------- 1.11.0: ROTAS TRIANGULARES NA MESMA CORRETORA ----------
+// USDT → X → USDC → USDT (ou o inverso), tudo dentro de uma corretora: sem transferências e sem precisar de saldo
+// noutras corretoras. Com stablecoins de taxa 0% (Binance, MEXC, Bitget) pequenas diferenças de preço viram lucro.
+const TRI_ENABLED = String(process.env.TRI_ENABLED ?? 'true').toLowerCase() !== 'false';
+async function triQuote(id, X, amount) {
+  const ex = client(id), sXT = X + '/USDT', sXC = X + '/USDC', sCT = 'USDC/USDT';
+  const [bXT, bXC, bCT] = await Promise.all([bookOf(id, sXT), bookOf(id, sXC), bookOf(id, sCT)]);
+  const f = s => takerFee(ex, s), out = [];
+  // A: compra X com USDT → vende X por USDC → vende USDC por USDT
+  if (bXT.asks[0] && bXC.bids[0] && bCT.bids[0]) {
+    const qx = amount / bXT.asks[0][0], w1 = walk(bXT.asks, qx), w2 = walk(bXC.bids, qx * (1 - f(sXT)));
+    if (w1 && w2) { const usdc = qx * (1 - f(sXT)) * w2.avg * (1 - f(sXC)), w3 = walk(bCT.bids, usdc);
+      if (w3) { const cost = qx * w1.avg, back = usdc * w3.avg * (1 - f(sCT));
+        out.push({ dir: 'A', path: `USDT→${X}→USDC→USDT`, legs: [{ symbol: sXT, side: 'buy', amount: qx, limit: w1.worst }, { symbol: sXC, side: 'sell', amount: qx * (1 - f(sXT)), limit: w2.worst }, { symbol: sCT, side: 'sell', amount: usdc, limit: w3.worst }], cost, back }); } }
+  }
+  // B: compra USDC com USDT → compra X com USDC → vende X por USDT
+  if (bCT.asks[0] && bXC.asks[0] && bXT.bids[0]) {
+    const qu = amount / bCT.asks[0][0], w1 = walk(bCT.asks, qu);
+    if (w1) { const usdc = qu * (1 - f(sCT)), qx0 = usdc / bXC.asks[0][0], w2 = walk(bXC.asks, qx0);
+      if (w2) { const qx = usdc / w2.avg * (1 - f(sXC)), w3 = walk(bXT.bids, qx);
+        if (w3) { const cost = qu * w1.avg, back = qx * w3.avg * (1 - f(sXT));
+          out.push({ dir: 'B', path: `USDT→USDC→${X}→USDT`, legs: [{ symbol: sCT, side: 'buy', amount: qu, limit: w1.worst }, { symbol: sXC, side: 'buy', amount: usdc / w2.avg, limit: w2.worst }, { symbol: sXT, side: 'sell', amount: qx, limit: w3.worst }], cost, back }); } } }
+  }
+  return out.map(o => ({ type: 'triangular', id: `TRI:${id}:${o.path}`, exchange: id, symbol: o.path, path: o.path, dir: o.dir, legs: o.legs, invest: o.cost, netProfit: o.back - o.cost, netPct: (o.back / o.cost - 1) * 100, meetsMin: (o.back / o.cost - 1) * 100 >= MIN_PROFIT_PCT }));
+}
+let triCache = { at: 0, list: [] };
+async function scanTriangles(amount) {
+  if (!TRI_ENABLED) return { ok: true, opportunities: [] };
+  if (Date.now() - triCache.at < 20000 && triCache.amount === amount) return { ok: true, opportunities: triCache.list };
+  const list = [];
+  for (const id of EXCHANGES) {                       // uma corretora de cada vez (memória)
+    if (!(await supports(id, 'USDC/USDT'))) continue;
+    for (const X of COINS) {
+      if (X === 'USDT' || X === 'USDC') continue;
+      if (!(await supports(id, X + '/USDT')) || !(await supports(id, X + '/USDC'))) continue;
+      try { list.push(...await triQuote(id, X, amount)); } catch (e) {}
+    }
+  }
+  list.sort((a, b) => b.netProfit - a.netProfit);
+  triCache = { at: Date.now(), amount, list: list.slice(0, 20) };
+  return { ok: true, minProfitPct: MIN_PROFIT_PCT, opportunities: triCache.list };
+}
+async function executeTriangle(input) {
+  const send = (code, body) => ({ code, body }), source = input.source || 'manual';
+  if (STOPPED) return send(423, { ok: false, status: 'aborted', message: 'Bot parado pelo botão de emergência' });
+  const { exchange, path: wanted } = input, amount = Math.min(Number(input.amount) || DEFAULT_AMOUNT, MAX_ORDER_QUOTE);
+  if (!EXCHANGES.includes(exchange)) return send(400, { ok: false, error: 'Corretora inválida' });
+  const X = (String(wanted).split('→').find(c => c && c !== 'USDT' && c !== 'USDC')) || '';
+  if (!COINS.includes(X)) return send(400, { ok: false, error: 'Rota inválida' });
+  // recalcula com os livros de agora
+  const q = (await triQuote(exchange, X, amount)).find(o => o.path === wanted);
+  if (!q || !q.meetsMin) { const t = { type: 'triangular', status: 'held', exchange, symbol: wanted, amount, netProfit: 0, lastNetPct: q?.netPct ?? null }; record({ source, ...t }); return send(200, { ok: true, ...t, message: 'Triangular abaixo do mínimo após recálculo — nada enviado' }); }
+  if (DRY_RUN) { const t = { type: 'triangular', status: 'dry_run', exchange, symbol: wanted, amount, netProfit: q.netProfit, netPct: q.netPct }; record({ source, ...t }); return send(200, { ok: true, ...t, message: `Simulação triangular ${wanted} na ${exchange}: lucro ${q.netProfit.toFixed(4)} USDT (${q.netPct.toFixed(3)}%) — nenhuma ordem enviada` }); }
+  if (!hasKeys(exchange)) return send(400, { ok: false, error: 'Falta a chave API desta corretora' });
+  // real: 3 ordens IOC em sequência, cada uma com o que a anterior realmente rendeu; se uma falhar, fica em stablecoin (sem perda relevante)
+  const ex = client(exchange), orders = []; let carry = null;
+  for (const [i, L] of q.legs.entries()) {
+    try {
+      let amt = L.amount;
+      if (carry != null) amt = L.side === 'sell' ? carry : Math.min(L.amount, carry / L.limit);
+      const o = await ex.createOrder(L.symbol, 'limit', L.side, Number(ex.amountToPrecision(L.symbol, amt)), Number(ex.priceToPrecision(L.symbol, L.limit)), { timeInForce: 'IOC' });
+      orders.push({ leg: i + 1, symbol: L.symbol, side: L.side, filled: o.filled, price: o.average ?? o.price });
+      if (!(o.filled > 0)) break;
+      carry = L.side === 'buy' ? o.filled : (o.cost ?? o.filled * (o.average ?? L.limit));
+    } catch (e) { orders.push({ leg: i + 1, symbol: L.symbol, error: e.message }); break; }
+  }
+  const done = orders.length === 3 && orders.every(o => o.filled > 0);
+  const t = { type: 'triangular', status: done ? 'executed' : orders.some(o => o.filled > 0) ? 'partial' : 'aborted', exchange, symbol: wanted, amount, netProfit: done ? q.netProfit : 0, netPct: q.netPct, orders };
+  record({ source, ...t });
+  return send(200, { ok: true, ...t, message: done ? `Triangular executada: lucro estimado ${q.netProfit.toFixed(4)} USDT` : 'Triangular incompleta: o saldo ficou noutra stablecoin, sem perda relevante' });
+}
+app.get('/api/triangles', wrap(async (req, res) => res.json(await scanTriangles(Number(req.query.amount) || DEFAULT_AMOUNT))));
+app.post('/api/execute-triangle', wrap(async (req, res) => { const r = await executeTriangle({ ...(req.body || {}), source: 'manual' }); res.status(r.code).json(r.body); }));
+
 function record(t) { const h = readJSON(HIST_FILE, []); h.unshift({ at: new Date().toISOString(), ...t }); writeJSON(HIST_FILE, h.slice(0, 1000)); scheduleHistSync(); }
 
 // histórico persistente num Gist privado do GitHub (o disco do Render Free apaga-se a cada deploy).
@@ -665,7 +739,24 @@ async function executeMaker(input) {
   const q = await quote(buyExchange, sellExchange, symbol, amount);
   if (!q || !q.maker) return send(200, { ok: true, status: 'aborted', message: 'Livro sem profundidade suficiente' });
   if (amount * q.buyPrice > MAX_ORDER_QUOTE) return send(400, { ok: false, status: 'aborted', message: `Acima do limite por operação (${MAX_ORDER_QUOTE})` });
-  const m = q.maker, [base, quoteCur] = symbol.split('/');
+  const m = { ...q.maker }, [base, quoteCur] = symbol.split('/');
+  // 1.11.0: pôr a ordem 1 tick À FRENTE do melhor preço (quando o spread deixa), para ficar primeiro na fila.
+  // Antes ficava atrás de toda a quantidade já parada nesse preço e quase nunca era executada.
+  let jumped = false;
+  try {
+    const mex = m.side === 'compra' ? client(buyExchange) : client(sellExchange);
+    await ensureMarkets(mex);
+    const pp = mex.markets?.[symbol]?.precision?.price; const tick = pp == null ? null : (pp >= 1 ? Math.pow(10, -pp) : pp);
+    const mb = await bookOf(m.side === 'compra' ? buyExchange : sellExchange, symbol);
+    const bb0 = mb.bids[0]?.[0], ba0 = mb.asks[0]?.[0];
+    if (tick && bb0 && ba0 && ba0 - bb0 > tick * 1.5) {
+      const np = m.side === 'compra' ? bb0 + tick : ba0 - tick;
+      const fM0 = m.side === 'compra' ? q.fees.buyMaker : q.fees.sellMaker;
+      const inv = m.side === 'compra' ? amount * np * (1 + fM0) : m.invest, rev = m.side === 'compra' ? m.revenue : amount * np * (1 - fM0);
+      // só salta se ainda ficar acima do lucro mínimo; senão mantém o preço original
+      if ((rev - inv) / inv * 100 >= MIN_PROFIT_PCT) { m.invest = inv; m.revenue = rev; m.limitPrice = np; m.netProfit = rev - inv; m.netPct = m.netProfit / inv * 100; jumped = true; }
+    }
+  } catch (e) {}
   if (!m.realistic || m.netPct < MIN_PROFIT_PCT) { const t = { type: 'maker', status: 'held', symbol, buyExchange, sellExchange, amount, netProfit: 0, lastNetPct: m.netPct }; record({ source, ...t }); return send(200, { ok: true, ...t, message: `Maker ${m.netPct.toFixed(3)}% abaixo do mínimo — nada enviado` }); }
   const bx = client(buyExchange), sx = client(sellExchange);
   const mx = m.side === 'compra' ? bx : sx, tx = m.side === 'compra' ? sx : bx;   // corretora maker / corretora taker
@@ -680,7 +771,7 @@ async function executeMaker(input) {
     // simulação: conta como executada a quantidade negociada publicamente ao nosso preço (ou melhor para quem nos vende/compra)
     let since = t0;
     // fila à nossa frente: quantidade que já estava nesse preço (essa é executada antes da nossa)
-    let ahead = 0; try { const ob0 = await mx.fetchOrderBook(symbol, 20); const lv = (makerSide === 'buy' ? ob0.bids : ob0.asks).find(([p]) => p === m.limitPrice); ahead = lv ? lv[1] : 0; } catch (e) {}
+    let ahead = 0; if (!jumped) try { const ob0 = await mx.fetchOrderBook(symbol, 20); const lv = (makerSide === 'buy' ? ob0.bids : ob0.asks).find(([p]) => p === m.limitPrice); ahead = lv ? lv[1] : 0; } catch (e) {}
     while (Date.now() < deadline && filled < amount) {
       await sleep(5000);
       if (!(await stillOk().catch(() => false))) { cancelled = 'outra ponta deixou de dar lucro'; break; }
@@ -723,7 +814,7 @@ async function executeMaker(input) {
     if (!DRY_RUN && Math.abs(filled - closed) > filled * 0.01) setStopped(true);
   }
   const status = filled <= 0 ? 'not_filled' : Math.abs(filled - closed) > filled * 0.01 ? 'partial' : (DRY_RUN ? 'dry_run' : 'executed');
-  const t = { type: 'maker', status, symbol, buyExchange, sellExchange, makerSide: m.side, limitPrice: m.limitPrice, amount, filled, closed, netProfit: profit, expectedNetProfit: m.netProfit, waitedSec: Math.round((Date.now() - t0) / 1000), cancelled };
+  const t = { type: 'maker', status, symbol, buyExchange, sellExchange, makerSide: m.side, limitPrice: m.limitPrice, frontOfQueue: jumped, amount, filled, closed, netProfit: profit, expectedNetProfit: m.netProfit, waitedSec: Math.round((Date.now() - t0) / 1000), cancelled };
   record({ source, ...t });
   const msg = status === 'not_filled' ? `Ordem maker não foi executada em ${t.waitedSec}s${cancelled ? ' (' + cancelled + ')' : ''} — sem perda` :
     status === 'partial' ? `Desequilíbrio: executou ${filled} e fechou ${closed} ${base}. Bot parado — verifique os saldos.` :
@@ -980,6 +1071,7 @@ async function autobotTick() {
     const doT = types.includes('transferencia') && !memHigh() && Date.now() - lastTransferScan > TRANSFER_SCAN_MIN * 60000 && ![...transferJobs.values()].some(j => j.status === 'running');
     if (doT) lastTransferScan = Date.now();
     const p1 = doT ? await scanTransfers(autobot.amount, false) : { opportunities: [] };
+    const p2 = TRI_ENABLED && autobot.triangular !== false && !memHigh() ? await scanTriangles(autobot.amount) : { opportunities: [] };
     const parts = [p0, p1];
     const score = o => Math.max(o.preview.maxNetProfit, autobot.useMaker && o.maker?.realistic ? o.maker.netProfit : 0);
     const data = { opportunities: parts[0].opportunities.concat(parts[1].opportunities).sort((x, y) => (score(y) - score(x)) || (y.netProfit - x.netProfit)) };
@@ -992,7 +1084,18 @@ async function autobotTick() {
       (!autobot.exchanges.length || (autobot.exchanges.includes(o.buyExchange) && autobot.exchanges.includes(o.sellExchange))) &&
       (DRY_RUN || (hasKeys(o.buyExchange) && hasKeys(o.sellExchange))) &&
       !((routeCooldown.get(o.id) || 0) > now));
+    autoState.lastBestTriangle = p2.opportunities[0] ? { id: p2.opportunities[0].id, netPct: p2.opportunities[0].netPct, netProfit: p2.opportunities[0].netProfit } : null;
     autoState.lastBest = data.opportunities[0] ? { id: data.opportunities[0].id, netPct: data.opportunities[0].netPct, netProfit: data.opportunities[0].netProfit, maxNetProfit: data.opportunities[0].preview.maxNetProfit } : null;
+    // triangulares (mesma corretora): executa a melhor se passar o mínimo e for melhor do que a melhor rota entre corretoras
+    const tri = p2.opportunities.find(o => o.meetsMin && o.netProfit >= autobot.minProfitUsdt && !((routeCooldown.get(o.id) || 0) > now) && (DRY_RUN || hasKeys(o.exchange)) && (!autobot.exchanges.length || autobot.exchanges.includes(o.exchange)));
+    if (tri && (!cands.length || tri.netProfit >= Math.max(cands[0].netProfit, cands[0].preview.maxNetProfit))) {
+      const r = await executeTriangle({ exchange: tri.exchange, path: tri.path, amount: autobot.amount, source: 'autobot' }); const b = r.body || {};
+      routeCooldown.set(tri.id, Date.now() + autobot.cooldownSec * 1000);
+      autoState.lastAction = { at: new Date().toISOString(), route: tri.id, status: b.status, netProfit: b.netProfit ?? 0, message: b.message || b.error };
+      if (b.status === 'dry_run') { autoState.simulated++; autoState.profitUsdt += b.netProfit || 0; }
+      if (b.status === 'executed') { autoState.trades++; autoState.profitUsdt += b.netProfit || 0; }
+      return;
+    }
     if (!cands.length) { autoState.lastAction = { at: autoState.lastScanAt, status: 'waiting', message: 'Nenhuma rota acima do mínimo' }; return; }
     for (const o of cands.slice(0, 3)) {
       const args = { buyExchange: o.buyExchange, sellExchange: o.sellExchange, symbol: o.symbol, amount: o.preview.maxAmount > 0 ? Math.min(o.preview.maxAmount, autobot.amount) : autobot.amount, source: 'autobot' };
