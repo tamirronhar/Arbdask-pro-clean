@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.15.0';
+const VERSION = '1.15.1';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -869,6 +869,19 @@ async function _networksOf(id) {
   } catch (e) { netCache[id] = { at: Date.now(), cur: c?.cur || {}, error: e.message.slice(0, 160) }; }
   return netCache[id].cur;
 }
+// 1.15.1: taxas reais de levantamento por moeda/rede/corretora (só leitura) — base para calcular o custo de reequilíbrio
+app.get('/api/withdraw-fees', wrap(async (req, res) => {
+  const coins = String(req.query.coins || 'USDT,USDS').toUpperCase().split(',').map(x => x.trim()).filter(Boolean).slice(0, 6);
+  const ids = EXCHANGES.filter(hasKeys), out = {};
+  for (const id of ids) {
+    let cur = {}; try { cur = await _networksOf(id); } catch (e) { out[id] = { error: e.message.slice(0, 120) }; continue; }
+    out[id] = {};
+    for (const c of coins) out[id][c] = Object.entries(cur[c]?.networks || {}).map(([k, v]) => ({ network: normNet(k), fee: typeof v.fee === 'number' ? v.fee : null, withdraw: v.withdraw !== false && v.active !== false, deposit: v.deposit !== false && v.active !== false, min: v.limits?.withdraw?.min ?? null }))
+      .sort((a, b) => (a.fee ?? 1e9) - (b.fee ?? 1e9));
+    if (global.gc) global.gc();
+  }
+  res.json({ ok: true, coins, fees: out });
+}));
 // redes em comum: saque ativo em A, depósito ativo em B, taxa de saque conhecida; a mais barata primeiro
 function commonNets(curA, curB, code) {
   const a = curA[code]?.networks || {}, b = curB[code]?.networks || {};
